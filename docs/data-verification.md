@@ -20,12 +20,32 @@ Real scraped support traffic, not synthetic. Evidence gathered 2026-08-12:
 - The reply-chain fields live-verified against the reconstruction contract
   (R31) at planning on 2026-08-11.
 
-**Caveat, stated plainly:** this is page- and schema-level evidence. The CSV has
-not been downloaded or inspected as of this record, because the Kaggle
-credential gate is open. Confirm at ingest by eyeballing a sample of threads for
-the messiness real traffic has and synthetic data does not — brand-voice
-inconsistency, truncated conversations, off-topic replies, non-English content.
-Update this section with that observation before U6 labeling begins.
+**Data-level confirmation — CLOSED 2026-08-12.** The CSV was downloaded
+(169 MB) and ingested: **2,811,774 tweets into 901,648 threads**, across 108
+distinct brand accounts. A random sample of multi-tweet threads carries the
+texture generated data does not have:
+
+- **Agent sign-off initials** on brand replies (`^PS`, `^mm`, `^FR`, `^Monica`) —
+  a real support-desk convention for attributing a shared account to a person.
+- **Character-limit artifacts**: replies manually split as `1/2`, `2/2`.
+- **Unmoderated customer affect**: all-caps escalation ("I HAVE BEEN REPLYING
+  SINCE TWO DAYS"), profanity, emoji, hashtags.
+- **Third-party intrusions**: uninvolved customers replying into another
+  customer's thread — exactly the sibling replies R31 excludes.
+- **Specific, non-templated grievances**: a bag lost JFK→Heathrow→Bucharest, a
+  £5 credit offered after a failed grocery delivery before a dinner party.
+- **Partial handle masking**: brands appear both as names (`@AmazonHelp`) and as
+  numeric ids (`@115830`, `@116035`) where the mention was not linked, alongside
+  the numeric customer ids — the signature of an anonymization pass over real
+  scraped text.
+
+Two reconstruction statistics worth carrying into the README's limitations:
+
+- **Truncated threads: 4,387 of 901,648 (0.49%)** — the dataset is a slice, so a
+  small fraction reference parents outside it.
+- **Cycle-flagged threads: 0.** Reply cycles do not occur in this data; the
+  cycle guard in R31 is defensive only, exercised by a synthetic fixture rather
+  than by real traffic. Do not claim it as a handled real-world case.
 
 ## Finding 2 — license: CC BY-NC-SA 4.0
 
