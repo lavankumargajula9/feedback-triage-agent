@@ -480,7 +480,7 @@ def _cmd_run(args: argparse.Namespace, client: Any = None) -> int:
 def _load_eval_threads(args: argparse.Namespace, thread_ids) -> dict[int, Any]:
     """Resolve every gold-labeled thread id against the store (input errors, R7)."""
     from triage.ingest import IngestError
-    from triage.ingest.store import get_thread
+    from triage.ingest.store import add_eval_item, get_thread
 
     conn = _open_existing_store(args.db or DEFAULT_DB_PATH)
     try:
@@ -494,6 +494,10 @@ def _load_eval_threads(args: argparse.Namespace, thread_ids) -> dict[int, Any]:
                     f"({args.db or DEFAULT_DB_PATH}); labels and store must describe "
                     "the same eval set"
                 ) from None
+            # Arms the store's gold-label guard (R11): labels live in the CSV, but
+            # ingest can only refuse to rewrite a labeled thread it knows about.
+            add_eval_item(conn, thread_id, "gold")
+        conn.commit()
         return threads
     finally:
         conn.close()
@@ -720,11 +724,11 @@ def _cmd_eval(args: argparse.Namespace, client: Any = None) -> int:
             run_id=args.run_id,
             client=client,
         )
-    # Deliberately broad: ANY mid-run failure must yield the resume
-    # instruction rather than a bare stack trace (R32).
-    except Exception as exc:  # noqa: BLE001
+    # Deliberately broad, and KeyboardInterrupt is not an Exception: ANY mid-run
+    # stop must yield the resume instruction rather than a bare stack trace (R32).
+    except (KeyboardInterrupt, Exception) as exc:  # noqa: BLE001
         done_now = len(completed_thread_ids(out_dir) & set(threads))
-        print(f"error: eval run interrupted: {exc}", file=sys.stderr)
+        print(f"error: eval run interrupted: {exc or type(exc).__name__}", file=sys.stderr)
         print(
             f"{done_now}/{len(threads)} threads checkpointed — {resume_instruction(out_dir)}",
             file=sys.stderr,
@@ -781,10 +785,14 @@ def _eval_judge_and_gate(
         except EvalError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_PIPELINE_FAILURE
-        # Deliberately broad: judge calls are the most expensive in the system,
-        # so any mid-scoring failure must yield the resume instruction (R32).
-        except Exception as exc:  # noqa: BLE001
-            print(f"error: judge scoring interrupted: {exc}", file=sys.stderr)
+        # Deliberately broad, and KeyboardInterrupt is not an Exception: judge
+        # calls are the most expensive in the system, so any mid-scoring stop
+        # must yield the resume instruction (R32).
+        except (KeyboardInterrupt, Exception) as exc:  # noqa: BLE001
+            print(
+                f"error: judge scoring interrupted: {exc or type(exc).__name__}",
+                file=sys.stderr,
+            )
             print(
                 "re-run the same `triage eval` command to resume; already-scored "
                 f"drafts are skipped via their checkpoints in {judge_checkpoint_dir(out_dir)}",

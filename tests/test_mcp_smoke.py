@@ -220,6 +220,7 @@ class TestEvalReport:
             "models": {"pipeline": "model-a", "baseline": "model-a", "judge": "model-b"},
             "prompt_hashes": {"categorize": "abc123"},
             "eval_set_hash": "deadbeef",
+            "thread_digest": "cafe1234",
             # A recorded reference always gates mean draft score (R15).
             "metrics": {"categorize_accuracy": 0.9, "mean_draft_score": 4.2},
             "spreads": {"categorize_accuracy": 0.01, "mean_draft_score": 0.1},

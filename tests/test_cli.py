@@ -100,6 +100,34 @@ class TestRunSingle:
         assert code == 2
         assert "9999" in err
 
+    def test_shared_tweet_resolves_to_its_own_authors_thread(self, sample_db, capsys):
+        # Fixture tweet 21 is a brand reply shared by threads 4 (customer
+        # 100005) and 5 (customer 100006). Tweet 22 is 100006's own, so it must
+        # reach 100006's thread rather than the lowest-id one.
+        client = FakeClient(list(HAPPY_OUTCOMES))
+        code, out, err = run_cli(
+            ["run", "22", "--db", str(sample_db)], capsys, client=client
+        )
+        assert code == 0, err
+        assert json.loads(out)["thread"]["tweet_ids"] == [20, 21, 22]
+
+    def test_shared_tweet_without_an_authoring_customer_is_deterministic(
+        self, sample_db, capsys
+    ):
+        # Tweet 21 itself is brand-authored, so no customer owns it; resolution
+        # must still be stable rather than order-dependent.
+        first, second = (
+            json.loads(
+                run_cli(
+                    ["run", "21", "--db", str(sample_db)],
+                    capsys,
+                    client=FakeClient(list(HAPPY_OUTCOMES)),
+                )[1]
+            )["thread"]["tweet_ids"]
+            for _ in range(2)
+        )
+        assert first == second
+
     def test_missing_store_exits_2(self, tmp_path, capsys):
         code, _, err = run_cli(
             ["run", "1", "--db", str(tmp_path / "absent.db")], capsys, client=ExplodingClient()

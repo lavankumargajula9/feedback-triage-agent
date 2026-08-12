@@ -625,6 +625,30 @@ class TestEvalCli:
         assert code == 2
         assert "9999" in err
 
+    def test_ctrl_c_mid_run_still_prints_the_resume_instruction(
+        self, eval_setup, capsys
+    ):
+        # KeyboardInterrupt is not an Exception, so a Ctrl-C during a paid run
+        # would otherwise escape the handler as a bare traceback (R32).
+        interrupted = FakeClient(list(PER_THREAD_OUTCOMES) + [KeyboardInterrupt()])
+        code, _, err = run_cli(eval_argv(eval_setup), capsys, client=interrupted)
+        assert code == 1
+        assert "resume" in err.lower()
+        assert "1/2 threads checkpointed" in err
+        assert not (eval_setup["out"] / "results.json").exists()
+
+    def test_eval_arms_the_stores_gold_label_guard(self, eval_setup, capsys):
+        # Labels live in a CSV, but ingest can only refuse to rewrite a labeled
+        # thread it knows about, so running an eval records them (R11).
+        code, _, _ = run_cli(eval_argv(eval_setup), capsys, client=happy_client(2))
+        assert code == 0
+        conn = open_store(eval_setup["db"])
+        try:
+            labeled = {row["thread_id"] for row in conn.execute("SELECT thread_id FROM eval_items")}
+        finally:
+            conn.close()
+        assert labeled == set(eval_setup["thread_ids"])
+
     def test_interrupted_run_exits_nonzero_with_resume_instruction(
         self, eval_setup, capsys
     ):

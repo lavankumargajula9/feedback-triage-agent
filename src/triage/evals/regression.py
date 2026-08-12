@@ -26,6 +26,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from triage.evals.runner import write_json_atomic
+
 DRAFT_SCORE_METRIC = "mean_draft_score"
 GATED_STEPS = ("categorize", "route", "escalate")
 GATED_STEP_METRICS = ("accuracy", "macro_precision", "macro_recall")
@@ -33,12 +35,13 @@ GATED_STEP_METRICS = ("accuracy", "macro_precision", "macro_recall")
 PERCENTAGE_FLOOR = 0.02
 
 # The determinism pins compared for environment drift (KTD10).
-ENVIRONMENT_KEYS = ("models", "prompt_hashes", "eval_set_hash")
+ENVIRONMENT_KEYS = ("models", "prompt_hashes", "eval_set_hash", "thread_digest")
 
 REFERENCE_REQUIRED_KEYS = (
     "models",
     "prompt_hashes",
     "eval_set_hash",
+    "thread_digest",
     "metrics",
     "spreads",
     "per_thread",
@@ -186,13 +189,14 @@ def record_reference(
         "models": results["models"],
         "prompt_hashes": results["prompt_hashes"],
         "eval_set_hash": results["eval_set_hash"],
+        "thread_digest": results["thread_digest"],
         "metrics": dict(metrics),
         "spreads": dict(spreads or {}),
         "per_thread": results["threads"],
     }
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(reference, indent=2), encoding="utf-8")
+    write_json_atomic(path, reference)
     return path
 
 

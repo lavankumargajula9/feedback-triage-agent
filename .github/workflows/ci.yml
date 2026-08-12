@@ -21,10 +21,12 @@ jobs:
       - name: Unit tests
         run: pytest -q
 
-      # End-to-end smoke over the installed console script. CI has no
-      # ANTHROPIC_API_KEY, so this covers the command surfaces that reach a
-      # result without an LLM call; the model-calling paths are covered by the
-      # mocked suite above and by the pilot gate.
+      # End-to-end smoke. CI has no ANTHROPIC_API_KEY: the console-script steps
+      # cover the surfaces that reach a result without an LLM call, and the
+      # stub-client step covers the four-step model-calling path offline.
+      - name: Smoke — triage a diagnosable thread through all four steps
+        run: python tests/ci_smoke.py
+
       - name: Smoke — ingest the bundled fixture
         run: triage ingest --sample --db "$RUNNER_TEMP/smoke.db"
 

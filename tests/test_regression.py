@@ -39,6 +39,7 @@ ENV = {
     "models": {"pipeline": "claude-haiku-4-5", "baseline": "claude-haiku-4-5"},
     "prompt_hashes": {"categorize": "h1", "draft": "h2"},
     "eval_set_hash": "e1",
+    "thread_digest": "t1",
 }
 
 
@@ -51,6 +52,7 @@ def make_reference(metrics, spreads=None, env=None):
         "models": env["models"],
         "prompt_hashes": env["prompt_hashes"],
         "eval_set_hash": env["eval_set_hash"],
+        "thread_digest": env["thread_digest"],
         "metrics": dict(metrics),
         "spreads": dict(spreads or {}),
         "per_thread": [],
@@ -129,17 +131,20 @@ class TestCheckRegression:
         assert "prompt_hashes" in check["drift"][0]
         assert check["ok"] is False
 
-    def test_all_three_drift_axes_are_checked(self):
+    def test_all_drift_axes_are_checked(self):
+        # thread_digest is an axis because ingest can change the thread text
+        # under a run without touching models, prompts, or the labels file.
         reference = make_reference({"categorize_accuracy": 0.90})
         drifted_env = {
             "models": {"pipeline": "other-model", "baseline": "claude-haiku-4-5"},
             "prompt_hashes": {"categorize": "CHANGED", "draft": "h2"},
             "eval_set_hash": "e2",
+            "thread_digest": "CHANGED",
         }
         check = check_regression({"categorize_accuracy": 0.90}, reference,
                                  current_env=drifted_env)
         drift_text = "\n".join(check["drift"])
-        for axis in ("models", "prompt_hashes", "eval_set_hash"):
+        for axis in ("models", "prompt_hashes", "eval_set_hash", "thread_digest"):
             assert axis in drift_text
 
 
@@ -180,6 +185,7 @@ REFERENCE_RESULTS = {
     "models": ENV["models"],
     "prompt_hashes": ENV["prompt_hashes"],
     "eval_set_hash": ENV["eval_set_hash"],
+    "thread_digest": ENV["thread_digest"],
     "threads": [{"thread_id": 1, "pipeline": {}, "baseline": {}, "ok": True}],
 }
 
