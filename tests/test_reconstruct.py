@@ -234,6 +234,62 @@ class TestReconstructAll:
         assert covered == set(tweets)
 
 
+def brand_rooted_truncated_thread() -> dict[int, Tweet]:
+    """A brand tweet whose parent is missing, then the customer's reply.
+
+    The upward walk from tweet 50 finds no customer at all (its only ancestor
+    is absent from the dataset), so the thread's customer must be resolved from
+    the branch below it — otherwise tweet 50 and tweet 51 name different
+    threads and R31's same-thread guarantee breaks.
+    """
+    return by_id(
+        tw(50, "BrandHelp", False, ts(0), parent=49),  # parent 49 not in dataset
+        tw(51, "100009", True, ts(5), parent=50),
+    )
+
+
+class TestBrandRootedTruncation:
+    def test_brand_tweet_resolves_to_the_customers_thread(self):
+        tweets = brand_rooted_truncated_thread()
+        from_brand = reconstruct_thread(50, tweets)
+        from_customer = reconstruct_thread(51, tweets)
+        assert from_brand.signature == from_customer.signature
+        assert from_brand.tweet_ids == (50, 51)
+        assert from_brand.customer_author_id == "100009"
+        assert from_brand.truncated is True
+
+    def test_no_phantom_customerless_thread_is_emitted(self):
+        # A single-tweet brand-only thread would be degenerate, so it would
+        # short-circuit to an escalated "insufficient content" result and shadow
+        # the real conversation for anyone triaging tweet 50.
+        threads = reconstruct_all(brand_rooted_truncated_thread())
+        assert [t.signature for t in threads] == [(50, "100009")]
+
+    def test_genuinely_brand_only_chain_still_has_no_customer(self):
+        # When no customer exists anywhere on the branch, customer stays None.
+        tweets = by_id(
+            tw(60, "BrandHelp", False, ts(0)),
+            tw(61, "BrandHelp", False, ts(5), parent=60),
+        )
+        threads = reconstruct_all(tweets)
+        assert [t.signature for t in threads] == [(60, None)]
+        assert threads[0].tweet_ids == (60, 61)
+
+    def test_competing_customers_below_a_brand_root_resolve_deterministically(self):
+        # Two customers reply to the same parentless brand tweet. Whichever
+        # branch tweet 70 is assigned to, the choice must be stable and both
+        # customers must still get their own thread.
+        tweets = by_id(
+            tw(70, "BrandHelp", False, ts(0), parent=69),
+            tw(71, "100010", True, ts(5), parent=70),
+            tw(72, "100011", True, ts(10), parent=70),
+        )
+        signatures = {t.signature for t in reconstruct_all(tweets)}
+        assert signatures == {(70, "100010"), (70, "100011")}
+        assert reconstruct_thread(70, tweets).signature == (70, "100010")
+        assert reconstruct_thread(70, tweets).signature == (70, "100010")
+
+
 class TestInterleavedIdOrdering:
     """Thread discovery must not depend on tweet ids matching chronology.
 

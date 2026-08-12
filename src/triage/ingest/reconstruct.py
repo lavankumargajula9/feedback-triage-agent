@@ -90,6 +90,35 @@ def build_child_index(tweets: dict[int, Tweet]) -> dict[int, list[int]]:
     return children
 
 
+def _downstream_customer(
+    chain: list[int], tweets: dict[int, Tweet], children: dict[int, list[int]]
+) -> str | None:
+    """The customer of the branch below a chain with no customer of its own (R31).
+
+    Breadth-first with tweet-id tiebreak, so several customers replying to the
+    same parentless brand tweet resolve deterministically.
+    """
+    seen = set(chain)
+    frontier = list(chain)
+    while frontier:
+        inbound_ids = sorted(
+            child_id
+            for node in frontier
+            for child_id in children.get(node, ())
+            if child_id in tweets and tweets[child_id].inbound
+        )
+        if inbound_ids:
+            return tweets[inbound_ids[0]].author_id
+        next_frontier = []
+        for node in frontier:
+            for child_id in children.get(node, ()):
+                if child_id not in seen and child_id in tweets:
+                    seen.add(child_id)
+                    next_frontier.append(child_id)
+        frontier = sorted(next_frontier)
+    return None
+
+
 def reconstruct_thread(
     tweet_id: int,
     tweets: dict[int, Tweet],
@@ -139,6 +168,8 @@ def reconstruct_thread(
         if tweets[chain_id].inbound:
             customer = tweets[chain_id].author_id
             break
+    if customer is None:
+        customer = _downstream_customer(chain, tweets, children)
 
     # Downward walk from the chain: follow the customer's branch and direct brand
     # replies; sibling replies from other customers are excluded (R31).
