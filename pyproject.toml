@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feedback-triage-agent"
+version = "0.1.0"
+description = "Customer-feedback triage system: LangGraph pipeline, MCP server, and quantified eval harness over real Twitter support data."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "langgraph==1.2.11",
+    "mcp==2.0.0",
+    "anthropic==0.121.0",
+    "kagglehub==1.0.2",
+    "pydantic==2.13.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+triage = "triage.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv"]
