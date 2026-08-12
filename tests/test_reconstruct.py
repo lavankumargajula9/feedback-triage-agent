@@ -70,6 +70,21 @@ def cyclic_thread() -> dict[int, Tweet]:
     )
 
 
+def interleaved_ids_thread() -> dict[int, Tweet]:
+    """Two customers share a prefix, and tweet ids run against chronology.
+
+    Customer A opens the thread (id 41), the brand replies (id 42), then
+    customer B butts in (id 40) — so ``sorted()`` reaches B's reply *first*,
+    before the root it descends from. Reconstruction must still yield both
+    customers' threads; walking B's branch does not consume A's.
+    """
+    return by_id(
+        tw(40, "100009", True, ts(10), parent=42),  # B, lowest id, latest tweet
+        tw(41, "100008", True, ts(0)),  # A's root
+        tw(42, "DeltaAssist", False, ts(5), parent=41),
+    )
+
+
 def multi_customer_thread() -> dict[int, Tweet]:
     """Customer B butts into A's thread; brand double-replies to A's follow-up."""
     return by_id(
@@ -217,3 +232,36 @@ class TestReconstructAll:
         for thread in reconstruct_all(tweets):
             covered.update(t.tweet_id for t in thread.tweets)
         assert covered == set(tweets)
+
+
+class TestInterleavedIdOrdering:
+    """Thread discovery must not depend on tweet ids matching chronology.
+
+    ``reconstruct_all`` iterates ids in ascending order and skips tweets a
+    previous thread already accounted for. A tweet may legitimately belong to
+    more than one customer's thread (a shared root or brand reply), so what a
+    completed thread may mark as accounted-for is exactly the tweets whose own
+    reconstruction provably yields that same thread: the customer's own. Marking
+    shared tweets instead would let whichever branch is reached first swallow
+    the other, which id ordering alone decides.
+    """
+
+    def test_both_customers_threads_survive_when_ids_run_backwards(self):
+        threads = reconstruct_all(interleaved_ids_thread())
+        signatures = {t.signature for t in threads}
+        assert signatures == {(41, "100008"), (41, "100009")}
+
+    def test_each_thread_keeps_its_own_branch_and_excludes_the_other_customer(self):
+        threads = {t.customer_author_id: t for t in reconstruct_all(interleaved_ids_thread())}
+        # A's thread: her root plus the brand reply — not B's interjection.
+        assert threads["100008"].tweet_ids == (41, 42)
+        # B's thread: the shared root and brand reply he replied to, plus his own.
+        assert threads["100009"].tweet_ids == (41, 42, 40)
+
+    def test_entering_from_the_shared_brand_reply_is_consistent(self):
+        # Reconstructing from the shared tweet directly resolves to the branch
+        # of its nearest customer ancestor (A), matching what reconstruct_all
+        # produces for her.
+        thread = reconstruct_thread(42, interleaved_ids_thread())
+        assert thread.signature == (41, "100008")
+        assert thread.tweet_ids == (41, 42)
