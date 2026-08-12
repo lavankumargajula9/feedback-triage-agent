@@ -238,11 +238,15 @@ def _thread_from_messages(payload: Any):
     )
 
 
-def _load_json_file(path: Path) -> Any:
+def _read_text(path: Path) -> str:
     try:
-        text = path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")
     except OSError as exc:
         raise InputError(f"cannot read {path}: {exc}") from None
+
+
+def _load_json_file(path: Path) -> Any:
+    text = _read_text(path)
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
@@ -251,10 +255,7 @@ def _load_json_file(path: Path) -> Any:
 
 def _load_batch_items(path: Path) -> list[Any]:
     """Batch file: newline-separated tweet ids, or a JSON array of ids/objects."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise InputError(f"cannot read {path}: {exc}") from None
+    text = _read_text(path)
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:

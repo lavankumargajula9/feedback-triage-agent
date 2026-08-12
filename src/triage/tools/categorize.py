@@ -11,7 +11,7 @@ from typing import Any
 from triage.ingest.reconstruct import Thread
 from triage.prompts import fragments
 from triage.tools.llm import call_with_schema
-from triage.tools.retrieval import degenerate_reason, render_thread
+from triage.tools.retrieval import build_user_text, degenerate_reason
 from triage.tools.schemas import CategorizeResult, OutputFailure
 
 STEP_NAME = "categorize"
@@ -35,7 +35,7 @@ def categorize(
         STEP_NAME,
         model=model,
         system=fragments.step_system(fragments.CATEGORIZE_INSTRUCTIONS),
-        user_text=fragments.thread_block(render_thread(thread)),
+        user_text=build_user_text(thread),
         schema=CategorizeResult,
         client=client,
     )

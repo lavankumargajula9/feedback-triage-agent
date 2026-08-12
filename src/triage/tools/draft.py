@@ -12,7 +12,7 @@ from typing import Any
 from triage.ingest.reconstruct import Thread
 from triage.prompts import fragments
 from triage.tools.llm import call_with_schema
-from triage.tools.retrieval import degenerate_reason, render_thread
+from triage.tools.retrieval import build_user_text, degenerate_reason
 from triage.tools.schemas import CategorizeResult, DraftResult, OutputFailure, RouteResult
 
 STEP_NAME = "draft"
@@ -33,17 +33,11 @@ def draft(
     """
     if degenerate_reason(thread) is not None:
         return DraftResult(draft=fragments.DEGENERATE_DRAFT)
-    category_label = category.label if isinstance(category, CategorizeResult) else None
-    queue_label = queue.queue if isinstance(queue, RouteResult) else None
-    user_text = fragments.thread_block(render_thread(thread))
-    prior = fragments.prior_outputs_block(category=category_label, queue=queue_label)
-    if prior:
-        user_text = f"{user_text}\n\n{prior}"
     return call_with_schema(
         STEP_NAME,
         model=model,
         system=fragments.step_system(fragments.DRAFT_INSTRUCTIONS),
-        user_text=user_text,
+        user_text=build_user_text(thread, category, queue),
         schema=DraftResult,
         client=client,
     )

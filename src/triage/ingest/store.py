@@ -92,7 +92,7 @@ def load_tweets_csv(csv_path: Path | str) -> dict[int, Tweet]:
 def _tweet_from_row(row: dict[str, str], csv_path: Path) -> Tweet:
     try:
         return Tweet(
-            tweet_id=int(float(row["tweet_id"])),
+            tweet_id=_to_int_id(row["tweet_id"]),
             author_id=row["author_id"],
             inbound=row["inbound"].strip().lower() in ("true", "1"),
             created_at=row["created_at"],
@@ -103,11 +103,15 @@ def _tweet_from_row(row: dict[str, str], csv_path: Path) -> Tweet:
         raise IngestError(f"Malformed row in {csv_path}: {row!r} ({exc})") from exc
 
 
+def _to_int_id(value: str) -> int:
+    return int(float(value))  # tolerate "12.0"-style values
+
+
 def _parse_optional_id(value: str | None) -> int | None:
     value = (value or "").strip()
     if not value:
         return None
-    return int(float(value))  # tolerate "12.0"-style values
+    return _to_int_id(value)
 
 
 def open_store(db_path: Path | str) -> sqlite3.Connection:

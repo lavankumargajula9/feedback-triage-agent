@@ -19,6 +19,8 @@ from typing import Any
 
 from triage.ingest.reconstruct import Thread
 from triage.ingest.store import get_thread
+from triage.prompts import fragments
+from triage.tools.schemas import CategorizeResult, OutputFailure, RouteResult
 
 _MENTION_RE = re.compile(r"@\w+")
 _URL_RE = re.compile(r"https?://\S+|\bpic\.twitter\.com/\S+")
@@ -111,3 +113,22 @@ def search_threads(
         (f"%{query}%", limit),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def build_user_text(
+    thread: Thread,
+    category: CategorizeResult | OutputFailure | None = None,
+    queue: RouteResult | OutputFailure | None = None,
+) -> str:
+    """Assemble a step's user text: rendered thread plus any prior outputs (KTD2).
+
+    Prior results that are typed failures or ``None`` simply omit their line in
+    the prior-outputs block, so prompts degrade gracefully (R27).
+    """
+    category_label = category.label if isinstance(category, CategorizeResult) else None
+    queue_label = queue.queue if isinstance(queue, RouteResult) else None
+    user_text = fragments.thread_block(render_thread(thread))
+    prior = fragments.prior_outputs_block(category=category_label, queue=queue_label)
+    if prior:
+        user_text = f"{user_text}\n\n{prior}"
+    return user_text

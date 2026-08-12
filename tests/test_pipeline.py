@@ -20,6 +20,7 @@ from test_tools import (
     DIAGNOSABLE,
     DRAFTED,
     ESCALATED,
+    HAPPY_OUTCOMES,
     MODEL,
     ROUTED,
     ExplodingClient,
@@ -40,8 +41,6 @@ from triage.tools import (
 
 # AE2 needs an affirmative escalation (test_tools' ESCALATED is escalate=False).
 ESCALATED_UP = EscalateResult(escalate=True, reason="Customer is furious and threatening churn.")
-
-HAPPY_OUTCOMES = [ok(CATEGORIZED), ok(ROUTED), ok(ESCALATED), ok(DRAFTED)]
 
 
 class TestGraphWiring:

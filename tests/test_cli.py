@@ -19,10 +19,10 @@ import json
 
 import pytest
 from test_tools import (
-    CATEGORIZED,
     DRAFTED,
     ESCALATED,
     FIXTURE_CSV,
+    HAPPY_OUTCOMES,
     ROUTED,
     ExplodingClient,
     FakeClient,
@@ -33,8 +33,6 @@ from test_tools import (
 from triage import cli
 from triage.ingest.store import ingest_csv
 from triage.tools import CategorizeResult
-
-HAPPY_OUTCOMES = [ok(CATEGORIZED), ok(ROUTED), ok(ESCALATED), ok(DRAFTED)]
 
 INLINE_MESSAGES = {
     "messages": [

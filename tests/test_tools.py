@@ -138,6 +138,9 @@ ROUTED = RouteResult(queue="Technical/Product", rationale="Needs the technical t
 DRAFTED = DraftResult(draft="So sorry about that — can you share your account email?")
 ESCALATED = EscalateResult(escalate=False, reason="Routine technical issue, macro-resolvable.")
 
+# One full pipeline's worth of successful step outcomes, in node order.
+HAPPY_OUTCOMES = [ok(CATEGORIZED), ok(ROUTED), ok(ESCALATED), ok(DRAFTED)]
+
 
 class TestHappyPath:
     def test_categorize_parses_and_stays_on_taxonomy(self):

@@ -14,6 +14,7 @@ own client) never touch the network here.
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 import anthropic
@@ -38,8 +39,14 @@ _MALFORMED_ERROR_TYPES = frozenset({"json_invalid", "json_type"})
 _OFF_TAXONOMY_ERROR_TYPES = frozenset({"literal_error", "enum"})
 
 
+@functools.cache
 def make_client() -> anthropic.Anthropic:
-    """Construct the default client from the environment key (never in tests)."""
+    """The default client from the environment key (never in tests).
+
+    Cached so one process reuses a single client (and its connection pool)
+    across steps and batch entries, while staying lazy: a run that never
+    reaches an LLM call (e.g. all-degenerate threads) never needs the key.
+    """
     return anthropic.Anthropic(api_key=get_api_key())
 
 
