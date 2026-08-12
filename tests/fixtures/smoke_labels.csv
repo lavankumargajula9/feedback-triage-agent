@@ -1,0 +1,4 @@
+thread_id,category,queue,escalate
+1,Technical/Product,Technical/Product,false
+2,Billing/Payments,Billing/Payments,true
+3,General Inquiry,General Inquiry,true

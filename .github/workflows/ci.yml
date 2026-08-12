@@ -1,0 +1,50 @@
+name: CI
+
+on: [push]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package and dev dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Unit tests
+        run: pytest -q
+
+      # End-to-end smoke over the installed console script. CI has no
+      # ANTHROPIC_API_KEY, so this covers the command surfaces that reach a
+      # result without an LLM call; the model-calling paths are covered by the
+      # mocked suite above and by the pilot gate.
+      - name: Smoke — ingest the bundled fixture
+        run: triage ingest --sample --db "$RUNNER_TEMP/smoke.db"
+
+      - name: Smoke — triage a thread end-to-end
+        run: |
+          triage run --input tests/fixtures/smoke_thread.json > "$RUNNER_TEMP/result.json"
+          python -c "
+          import json, sys
+          result = json.load(open(sys.argv[1]))
+          steps = result['steps']
+          assert steps['categorize']['label'], 'no category label'
+          assert steps['route']['queue'], 'no route queue'
+          assert steps['escalate']['reason'], 'no escalation reason'
+          assert steps['draft']['status'] == 'never_sent', steps['draft']
+          print('smoke ok:', steps['categorize']['label'])
+          " "$RUNNER_TEMP/result.json"
+
+      - name: Smoke — eval cost preview executes nothing
+        run: |
+          triage eval --dry-run \
+            --labels tests/fixtures/smoke_labels.csv \
+            --db "$RUNNER_TEMP/smoke.db" \
+            --out "$RUNNER_TEMP/eval"

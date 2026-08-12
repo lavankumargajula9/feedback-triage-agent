@@ -1,0 +1,10 @@
+{
+  "messages": [
+    {
+      "author": "100042",
+      "inbound": true,
+      "text": "@brand help",
+      "created_at": "Tue Oct 31 22:00:00 +0000 2017"
+    }
+  ]
+}
