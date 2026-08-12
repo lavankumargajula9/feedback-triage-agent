@@ -8,7 +8,12 @@ continue past per-thread failures and exit nonzero if any failed (R7).
 ``triage eval`` runs both eval arms (4-step pipeline and single-prompt
 baseline, R8) over the gold-labeled set: cache-first (KTD5), checkpointed and
 resumable (R32); it prints its planned call count and rough cost BEFORE
-executing, and ``--dry-run`` executes nothing.
+executing, and ``--dry-run`` executes nothing. ``--judge`` additionally scores
+both arms' drafts (R13) and puts mean draft score into the regression gate —
+opt-in, because judge calls are the priciest in the system, and counted and
+priced in the same preview. Recording a reference requires that judge score
+and the variance-pass spreads the R15 tolerances are derived from, so the
+gate can never look armed while silently doing nothing.
 
 Threads come from the SQLite store by tweet id (any tweet id in a thread
 resolves to that thread, R31) or from an ``--input`` JSON file built into a
@@ -187,6 +192,43 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="print the planned call count and rough cost, then execute nothing",
+    )
+    evaluate.add_argument(
+        "--judge",
+        action="store_true",
+        help=(
+            "score both arms' drafts with the judge model (R13) and gate mean draft "
+            "score; OPT-IN because judge calls are the priciest in the system"
+        ),
+    )
+    evaluate.add_argument(
+        "--anchors",
+        type=Path,
+        default=None,
+        help=(
+            "held-out anchor-stock JSON supplying the judge's few-shot examples "
+            "(R14; required with --judge)"
+        ),
+    )
+    evaluate.add_argument(
+        "--spreads",
+        type=Path,
+        default=None,
+        help=(
+            "JSON map of gated metric -> observed run-to-run spread from the variance "
+            "passes (R21); the R15 tolerances are derived from it"
+        ),
+    )
+    evaluate.add_argument(
+        "--variance-results",
+        type=Path,
+        action="append",
+        default=None,
+        metavar="RESULTS",
+        help=(
+            "results.json from a prior variance pass (repeat 2+ times, 3 per R21) to "
+            "derive the spreads instead of supplying them with --spreads"
+        ),
     )
     evaluate.add_argument(
         "--regression",
@@ -457,6 +499,165 @@ def _load_eval_threads(args: argparse.Namespace, thread_ids) -> dict[int, Any]:
         conn.close()
 
 
+def _judge_options(args: argparse.Namespace) -> dict[str, Any]:
+    """Resolve the judge/gate flags BEFORE anything is spent (R13, R15, KTD10).
+
+    Every way the draft gate could end up decorative — no judge, no anchor
+    stock, no measured spreads, a reference that gates a metric this run will
+    not produce — is refused here, where refusing is free.
+    """
+    from triage.config import ROLE_JUDGE, get_model
+    from triage.evals.judge import judge_plan, load_anchor_stock
+    from triage.evals.regression import DRAFT_SCORE_METRIC, RegressionError, load_reference
+
+    reference = None
+    if args.regression is not None:
+        try:
+            reference = load_reference(args.regression)
+        except RegressionError as exc:
+            raise InputError(str(exc)) from None
+        if DRAFT_SCORE_METRIC in reference["metrics"] and not args.judge:
+            raise InputError(
+                f"the reference gates {DRAFT_SCORE_METRIC!r} but this run would produce "
+                "no draft score: re-run with --judge --anchors <anchor stock>, or the "
+                "draft-quality gate silently does not exist (R15)"
+            )
+    if args.record_reference is not None and not args.judge:
+        raise InputError(
+            f"--record-reference needs a judge-scored {DRAFT_SCORE_METRIC!r}: re-run with "
+            "--judge --anchors <anchor stock> (R13); a reference recorded without it "
+            "would pass the draft gate vacuously"
+        )
+    variance = args.variance_results or []
+    if args.record_reference is not None and args.spreads is None and not variance:
+        raise InputError(
+            "--record-reference needs the variance-pass spreads (R21): pass "
+            "--spreads <map.json>, or --variance-results <results.json> at least twice; "
+            "without them every tolerance collapses to the R15 floor"
+        )
+    if args.spreads is not None and variance:
+        raise InputError("pass either --spreads or --variance-results, not both")
+    if len(variance) == 1:
+        raise InputError(
+            "--variance-results needs at least two passes to measure a spread "
+            "(R21 runs three); pass it again, or supply --spreads directly"
+        )
+    if args.judge and args.anchors is None:
+        raise InputError(
+            "--judge needs --anchors <anchor stock JSON>: the judge's few-shot anchors "
+            "come from the separate held-out anchor stock, never from the eval set (R14)"
+        )
+    judge_model = get_model(ROLE_JUDGE, args.profile) if args.judge else None
+    return {
+        "reference": reference,
+        "anchors": load_anchor_stock(args.anchors) if args.judge else [],
+        "judge_model": judge_model,
+        "plan": judge_plan(judge_model) if args.judge else None,
+        "spreads": _load_spreads(args.spreads) if args.spreads is not None else None,
+    }
+
+
+def _load_spreads(path: Path) -> dict[str, float]:
+    """The observed run-to-run spread per gated metric (R15, R21)."""
+    payload = _load_json_file(path)
+    if not isinstance(payload, dict) or not payload:
+        raise InputError(
+            f"{path} must be a non-empty JSON object mapping gated metric names to "
+            "their observed run-to-run spread (R21)"
+        )
+    try:
+        return {str(name): float(value) for name, value in payload.items()}
+    except (TypeError, ValueError):
+        raise InputError(f"{path} has a non-numeric spread value") from None
+
+
+def _score_drafts(
+    results: dict[str, Any],
+    labels,
+    *,
+    args: argparse.Namespace,
+    options: dict[str, Any],
+    out_dir: Path,
+    client: Any,
+    threads: dict[int, str],
+) -> dict[str, Any]:
+    """Judge both arms' drafts for one complete run (R13, R32, KTD5)."""
+    from triage.evals.judge import score_run
+
+    return score_run(
+        results,
+        labels,
+        model=options["judge_model"],
+        anchors=options["anchors"],
+        out_dir=out_dir,
+        cache_path=args.cache,
+        client=client,
+        threads=threads,
+        run_id=results.get("run_id", ""),
+    )
+
+
+def _format_judge_summary(report: dict[str, Any]) -> str:
+    """Draft quality reported alongside, never blended into, the metrics (R13)."""
+    systems = report["systems"]
+    scores = ", ".join(
+        f"{name}={summary['mean_draft_score']:.4f}" for name, summary in systems.items()
+    )
+    disclosure = ", ".join(
+        f"{name} {summary['unscorable']['count']}/{summary['unscorable']['total']} "
+        f"({summary['unscorable']['rate']:.1%})"
+        for name, summary in systems.items()
+    )
+    return (
+        f"Judge (R13, model={report['model']}): mean draft score {scores}\n"
+        f"Unscorable drafts, counted not dropped (R27): {disclosure}"
+    )
+
+
+def _resolve_spreads(
+    args: argparse.Namespace,
+    labels,
+    results: dict[str, Any],
+    *,
+    options: dict[str, Any],
+    client: Any,
+    threads: dict[int, str],
+) -> dict[str, float]:
+    """The R15 tolerances' input: supplied spreads, or spreads measured across
+    variance-pass results files (R21)."""
+    from triage.evals.metrics import compute_report
+    from triage.evals.regression import environment_of, gated_metrics
+
+    if options["spreads"] is not None:
+        return options["spreads"]
+    values: dict[str, list[float]] = {}
+    for path in args.variance_results:
+        pass_results = _load_json_file(path)
+        try:
+            same_environment = environment_of(pass_results) == environment_of(results)
+        except (KeyError, TypeError):
+            raise InputError(f"{path} is not a complete eval results file") from None
+        if not same_environment:
+            raise InputError(
+                f"variance pass {path} was produced in a different environment (models, "
+                "prompt hashes or eval set differ), so its spread does not describe this "
+                "run (R21, KTD10)"
+            )
+        mean_draft_score = None
+        if args.judge:
+            report = _score_drafts(
+                pass_results, labels, args=args, options=options,
+                out_dir=Path(path).parent, client=client, threads=threads,
+            )
+            mean_draft_score = report["systems"]["pipeline"]["mean_draft_score"]
+        pass_metrics = gated_metrics(
+            compute_report(pass_results, labels), mean_draft_score=mean_draft_score
+        )
+        for name, value in pass_metrics.items():
+            values.setdefault(name, []).append(value)
+    return {name: max(observed) - min(observed) for name, observed in values.items()}
+
+
 def _cmd_eval(args: argparse.Namespace, client: Any = None) -> int:
     """Cache-first, checkpointed, resumable eval over both arms (R8, R32, KTD5)."""
     from triage.config import ROLE_BASELINE, ROLE_PIPELINE, get_model
@@ -485,6 +686,7 @@ def _cmd_eval(args: argparse.Namespace, client: Any = None) -> int:
         suffix = f"-{args.run_id}" if args.run_id else ""
         out_dir = DEFAULT_EVAL_OUT_DIR.with_name(DEFAULT_EVAL_OUT_DIR.name + suffix)
     try:
+        options = _judge_options(args)
         labels = load_gold_labels(args.labels)
         threads = _load_eval_threads(args, list(labels))
     except (EvalError, InputError) as exc:
@@ -501,6 +703,7 @@ def _cmd_eval(args: argparse.Namespace, client: Any = None) -> int:
             baseline_model=baseline_model,
             profile=args.profile,
             run_id=args.run_id,
+            judge=options["plan"],
         )
     )
     if args.dry_run:
@@ -542,31 +745,73 @@ def _cmd_eval(args: argparse.Namespace, client: Any = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_PIPELINE_FAILURE
     print(f"Results: {results_path}")
-    if args.record_reference is None and args.regression is None:
+    if not (args.judge or args.record_reference is not None or args.regression is not None):
         return EXIT_OK
-    return _eval_reference_and_regression(args, results_path, labels)
+    return _eval_judge_and_gate(
+        args, options, results_path, labels, threads, out_dir=out_dir, client=client
+    )
 
 
-def _eval_reference_and_regression(args: argparse.Namespace, results_path: Path, labels) -> int:
-    """Record and/or check the reference AFTER a complete run (R15, KTD10)."""
+def _eval_judge_and_gate(
+    args: argparse.Namespace,
+    options: dict[str, Any],
+    results_path: Path,
+    labels,
+    threads,
+    *,
+    out_dir: Path,
+    client: Any,
+) -> int:
+    """Judge the drafts, then record and/or check the reference (R13, R15, KTD10)."""
     from triage.evals import regression
+    from triage.evals.judge import judge_checkpoint_dir
     from triage.evals.metrics import compute_report
+    from triage.evals.runner import EvalError
+    from triage.tools.retrieval import render_thread
 
     results = json.loads(Path(results_path).read_text(encoding="utf-8"))
-    gated = regression.gated_metrics(compute_report(results, labels))
+    rendered = {tid: render_thread(thread) for tid, thread in threads.items()}
+    mean_draft_score = None
+    if args.judge:
+        try:
+            report = _score_drafts(
+                results, labels, args=args, options=options, out_dir=out_dir,
+                client=client, threads=rendered,
+            )
+        except EvalError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_PIPELINE_FAILURE
+        # Deliberately broad: judge calls are the most expensive in the system,
+        # so any mid-scoring failure must yield the resume instruction (R32).
+        except Exception as exc:  # noqa: BLE001
+            print(f"error: judge scoring interrupted: {exc}", file=sys.stderr)
+            print(
+                "re-run the same `triage eval` command to resume; already-scored "
+                f"drafts are skipped via their checkpoints in {judge_checkpoint_dir(out_dir)}",
+                file=sys.stderr,
+            )
+            return EXIT_PIPELINE_FAILURE
+        mean_draft_score = report["systems"]["pipeline"]["mean_draft_score"]
+        print(_format_judge_summary(report))
+    gated = regression.gated_metrics(
+        compute_report(results, labels), mean_draft_score=mean_draft_score
+    )
     if args.record_reference is not None:
-        # KTD10: this explicit flag is the ONLY path that records a reference.
-        reference_path = regression.record_reference(
-            results, gated, path=args.record_reference
-        )
+        try:
+            spreads = _resolve_spreads(
+                args, labels, results, options=options, client=client, threads=rendered
+            )
+            # KTD10: this explicit flag is the ONLY path that records a reference.
+            reference_path = regression.record_reference(
+                results, gated, spreads=spreads, path=args.record_reference
+            )
+        except (InputError, EvalError, regression.RegressionError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_INPUT_ERROR
         print(f"Reference recorded: {reference_path}")
-    if args.regression is None:
+    reference = options["reference"]
+    if reference is None:
         return EXIT_OK
-    try:
-        reference = regression.load_reference(args.regression)
-    except regression.RegressionError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return EXIT_INPUT_ERROR
     check = regression.check_regression(
         gated, reference, current_env=regression.environment_of(results)
     )

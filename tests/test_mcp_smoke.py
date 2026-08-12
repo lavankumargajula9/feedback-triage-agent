@@ -220,8 +220,9 @@ class TestEvalReport:
             "models": {"pipeline": "model-a", "baseline": "model-a", "judge": "model-b"},
             "prompt_hashes": {"categorize": "abc123"},
             "eval_set_hash": "deadbeef",
-            "metrics": {"categorize_accuracy": 0.9},
-            "spreads": {"categorize_accuracy": 0.01},
+            # A recorded reference always gates mean draft score (R15).
+            "metrics": {"categorize_accuracy": 0.9, "mean_draft_score": 4.2},
+            "spreads": {"categorize_accuracy": 0.01, "mean_draft_score": 0.1},
             "per_thread": [{"thread_id": 1}],
         }
         reference_path.write_text(json.dumps(reference), encoding="utf-8")
@@ -230,7 +231,7 @@ class TestEvalReport:
         assert not result.is_error
         payload = result.structured_content
         assert payload["status"] == "recorded"
-        assert payload["metrics"] == {"categorize_accuracy": 0.9}
+        assert payload["metrics"] == {"categorize_accuracy": 0.9, "mean_draft_score": 4.2}
         assert payload["eval_set_hash"] == "deadbeef"
         assert payload["thread_count"] == 1
 

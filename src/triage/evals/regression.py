@@ -160,7 +160,25 @@ def record_reference(
     caller) reaches this; nothing records a reference automatically. Pins
     model IDs, prompt hashes, the eval-set hash, and per-thread outputs, plus
     the gated metrics and their observed variance-pass spreads.
+
+    A reference without ``mean_draft_score`` or without measured spreads is
+    refused rather than written: both defects make the gate look armed while
+    it silently is not (R15, R21).
     """
+    if DRAFT_SCORE_METRIC not in metrics:
+        raise RegressionError(
+            f"refusing to record a reference without the {DRAFT_SCORE_METRIC!r} metric: "
+            "the draft-quality gate would silently not exist. Re-run with judging "
+            "enabled (`triage eval --judge`, R13)."
+        )
+    if not spreads:
+        raise RegressionError(
+            "refusing to record a reference with no measured spreads: every "
+            "percentage tolerance would collapse to the 2-point floor and the "
+            f"{DRAFT_SCORE_METRIC!r} tolerance to zero (R15). Supply the spreads "
+            "measured by the variance passes (R21) with `--spreads` or "
+            "`--variance-results`."
+        )
     reference = {
         "recorded_at": datetime.now(UTC).isoformat(),
         "run_id": results.get("run_id", ""),
@@ -195,5 +213,11 @@ def load_reference(path: Path | str) -> dict[str, Any]:
         raise RegressionError(
             f"reference artifact {path} is missing key(s): {', '.join(missing)}; "
             "re-record it with `triage eval --record-reference`"
+        )
+    if DRAFT_SCORE_METRIC not in reference["metrics"]:
+        raise RegressionError(
+            f"reference artifact {path} has no {DRAFT_SCORE_METRIC!r} metric, so it "
+            "cannot gate draft quality (R15); re-record it with judging enabled "
+            "(`triage eval --judge --record-reference`)"
         )
     return reference

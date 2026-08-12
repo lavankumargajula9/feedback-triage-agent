@@ -16,7 +16,12 @@ the classification metrics (R13). The judge:
 - scores both arms including escalated threads; a draft that is missing (its
   step failed) or that the judge cannot score after schema-enforced retries is
   scored at the floor and DISCLOSED as unscorable — never dropped from the
-  denominator (R27, AE6).
+  denominator (R27, AE6);
+- checkpoints every scored draft to disk and routes every call through the
+  shared cache (R32, KTD5). These are the priciest calls in the system, so a
+  crash keeps what was already paid for and a replay is free; each checkpoint
+  is pinned to the judge model, judge prompt (anchors included) and draft text
+  that produced it, and a mismatch is refused rather than mixed.
 
 The judge-vs-human agreement protocol (R14) is frozen here, in code, before
 any judge output is inspected — see :data:`AGREEMENT_PROTOCOL` and
@@ -25,15 +30,25 @@ any judge output is inspected — see :data:`AGREEMENT_PROTOCOL` and
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from statistics import mean
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from triage.evals.runner import GoldLabel
+from triage.evals.cache import CachingClient, CallCache, call_cost
+from triage.evals.runner import (
+    EvalError,
+    GoldLabel,
+    identity_mismatch,
+    load_checkpoint,
+    sha256_text,
+    write_json_atomic,
+)
 from triage.tools.llm import call_with_schema
 from triage.tools.schemas import OutputFailure
 
@@ -113,6 +128,61 @@ class AnchorExample:
     scores: Mapping[str, int]
     critiques: Mapping[str, str]
     send_as_is: bool
+
+
+ANCHOR_FIELDS = ("item_id", "category", "draft", "scores", "critiques", "send_as_is")
+
+
+def load_anchor_stock(path: Path | str) -> list[AnchorExample]:
+    """Load the held-out anchor stock the judge's few-shots come from (R14).
+
+    Every defect is an EvalError: a malformed anchor file must never reach a
+    paid judge call, and anchors carved from the eval set would invalidate the
+    agreement protocol.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise EvalError(
+            f"no anchor stock at {path}: the judge's few-shot anchors come from the "
+            "held-out anchor stock produced by the U6 labeling pass — a JSON array of "
+            f"objects with keys: {', '.join(ANCHOR_FIELDS)} (R14)"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EvalError(f"anchor stock {path} is not readable JSON: {exc}") from None
+    if not isinstance(payload, list) or not payload:
+        raise EvalError(f"anchor stock {path} must be a non-empty JSON array of anchors")
+    return [_parse_anchor(item, path=path, index=index) for index, item in enumerate(payload)]
+
+
+def _parse_anchor(item: Any, *, path: Path, index: int) -> AnchorExample:
+    if not isinstance(item, dict):
+        raise EvalError(f"anchor {index} in {path} must be a JSON object")
+    missing = [field for field in ANCHOR_FIELDS if field not in item]
+    if missing:
+        raise EvalError(
+            f"anchor {index} in {path} is missing key(s): {', '.join(missing)}; "
+            f"expected: {', '.join(ANCHOR_FIELDS)}"
+        )
+    scores, critiques = item["scores"], item["critiques"]
+    for dimension in DIMENSIONS:
+        value = scores.get(dimension) if isinstance(scores, dict) else None
+        if not isinstance(value, int) or not MIN_SCORE <= value <= MAX_SCORE:
+            raise EvalError(
+                f"anchor {index} in {path} needs an integer {dimension} score in "
+                f"{MIN_SCORE}-{MAX_SCORE}; got {value!r}"
+            )
+        if not isinstance(critiques, dict) or not critiques.get(dimension):
+            raise EvalError(f"anchor {index} in {path} is missing a {dimension} critique (R13)")
+    return AnchorExample(
+        item_id=str(item["item_id"]),
+        category=str(item["category"]),
+        draft=str(item["draft"]),
+        scores={dimension: int(scores[dimension]) for dimension in DIMENSIONS},
+        critiques={dimension: str(critiques[dimension]) for dimension in DIMENSIONS},
+        send_as_is=bool(item["send_as_is"]),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +310,103 @@ def _baseline_draft(entry: Mapping[str, Any]) -> str | None:
 
 _DRAFT_EXTRACTORS = {"pipeline": _pipeline_draft, "baseline": _baseline_draft}
 
+# One judge call per (thread, arm) — judging is per draft, not per thread.
+JUDGE_CALLS_PER_THREAD = len(_DRAFT_EXTRACTORS)
+
+# Rough per-judge-call token budget from the plan; cost preview only.
+JUDGE_TOKENS_IN_PER_CALL = 2500
+JUDGE_TOKENS_OUT_PER_CALL = 500
+
+
+def judge_cost_per_call(model: str) -> float | None:
+    """Rough dollars per judge call, or None with no price on file."""
+    return call_cost(model, JUDGE_TOKENS_IN_PER_CALL, JUDGE_TOKENS_OUT_PER_CALL)
+
+
+def judge_plan(model: str) -> dict[str, Any]:
+    """The judge's share of the pre-execution cost preview (R32)."""
+    return {
+        "model": model,
+        "calls_per_thread": JUDGE_CALLS_PER_THREAD,
+        "cost_per_call": judge_cost_per_call(model),
+        "tokens_in": JUDGE_TOKENS_IN_PER_CALL,
+        "tokens_out": JUDGE_TOKENS_OUT_PER_CALL,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Judge checkpoints (R32, KTD5) — the priciest calls in the system.
+# ---------------------------------------------------------------------------
+
+# A draft that never existed still gets a checkpoint, so a later run that DOES
+# have one is a fingerprint mismatch rather than a silent reuse of the floor.
+MISSING_DRAFT_FINGERPRINT = "missing-draft"
+
+
+def judge_checkpoint_dir(out_dir: Path | str) -> Path:
+    return Path(out_dir) / "judge"
+
+
+def judge_checkpoint_path(out_dir: Path | str, system: str, thread_id: int) -> Path:
+    return judge_checkpoint_dir(out_dir) / f"{system}-{thread_id}.json"
+
+
+def draft_fingerprint(draft: str | None) -> str:
+    """SHA-256 of the exact draft text the judge scored (R32)."""
+    return MISSING_DRAFT_FINGERPRINT if draft is None else sha256_text(draft)
+
+
+def judge_identity(
+    *, model: str, anchors: Sequence[AnchorExample], run_id: str = ""
+) -> dict[str, Any]:
+    """What a judge checkpoint must have been produced by to belong here (KTD5).
+
+    The anchors are part of the judge, so they enter the prompt hash: a
+    different anchor stock is a different judge and its scores may not be
+    mixed with these.
+    """
+    return {
+        "judge_model": model,
+        "judge_prompt_hash": sha256_text(judge_system(anchors)),
+        "run_id": run_id,
+    }
+
+
+def _refuse_mismatched_checkpoints(
+    out_dir: Path, items: Sequence[tuple[str, int, str | None]], identity: dict[str, Any]
+) -> None:
+    """Raise EvalError before spending anything if another judge ran here."""
+    for system, thread_id, draft in items:
+        path = judge_checkpoint_path(out_dir, system, thread_id)
+        if not path.is_file():
+            continue
+        entry = load_checkpoint(path)
+        field = identity_mismatch(identity, entry.get("identity"))
+        if field is not None:
+            raise EvalError(
+                f"judge checkpoint {path} was produced by a different judge "
+                f"({field} differs); mixing judge generations would report draft "
+                "scores the recorded judge model and prompt do not describe. Use a "
+                "fresh --out directory for this configuration, or delete "
+                f"{judge_checkpoint_dir(out_dir)} to re-score from scratch."
+            )
+        found = entry.get("draft_fingerprint")
+        expected = draft_fingerprint(draft)
+        if found != expected:
+            reason = (
+                "the checkpoint predates draft fingerprinting"
+                if found is None
+                else "the draft text has changed since it was scored"
+            )
+            raise EvalError(
+                f"judge checkpoint {path} scored different content for {system} "
+                f"thread {thread_id} ({reason}); mixing draft generations would "
+                "report scores the current run's drafts do not describe. Use a fresh "
+                "--out directory, or delete that judge directory to re-score."
+            )
+        if "record" not in entry:
+            raise EvalError(f"judge checkpoint {path} has no scored record; delete it to re-score")
+
 
 def _unscorable_record(reason: str) -> dict[str, Any]:
     """The floor-scored, disclosed record for an unscorable draft (R27, AE6)."""
@@ -284,44 +451,97 @@ def _summarize(per_thread: Mapping[int, Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _judge_record(
+    draft: str | None,
+    gold_label: GoldLabel,
+    *,
+    model: str,
+    anchors: Sequence[AnchorExample],
+    thread_text: str | None,
+    client: Any,
+) -> dict[str, Any]:
+    """One draft's scored (or disclosed-unscorable) record (R13, R27)."""
+    if draft is None:
+        return _unscorable_record("the draft step failed (R27)")
+    result = judge_draft(
+        draft,
+        category=gold_label.category,
+        escalated=gold_label.escalate,
+        model=model,
+        anchors=anchors,
+        thread_text=thread_text,
+        client=client,
+    )
+    if isinstance(result, OutputFailure):
+        return _unscorable_record(f"judge output {result.kind} after {result.attempts} attempts")
+    return _scored_record(result)
+
+
 def score_run(
     results: Mapping[str, Any],
     gold: Mapping[int, GoldLabel],
     *,
     model: str,
     anchors: Sequence[AnchorExample],
+    out_dir: Path | str,
+    cache_path: Path | str,
     client: Any = None,
     threads: Mapping[int, str] | None = None,
+    run_id: str = "",
 ) -> dict[str, Any]:
-    """Judge every draft in a completed run: both arms, escalated threads
-    included (R13). ``threads`` optionally maps thread ids to rendered thread
-    text for extra judge context. The result is a standalone report — draft
-    quality is never blended into the classification metrics."""
+    """Judge every draft in a completed run — checkpointed and resumable
+    (R13, R32, KTD5).
+
+    Both arms are scored, escalated threads included; ``threads`` optionally
+    maps thread ids to rendered thread text for extra judge context. Judging is
+    per (thread, arm), so each scored draft is checkpointed under that key
+    before the next call begins: an interruption keeps every judge call already
+    paid for. Calls go through the shared SQLite cache, so a replay is free.
+    Every checkpoint is pinned to the judge model, judge prompt (anchors
+    included) and draft text that produced it, and a mismatch is refused rather
+    than mixed. The result is a standalone report — draft quality is never
+    blended into the classification metrics.
+    """
     threads = threads or {}
+    out_dir = Path(out_dir)
+    judge_checkpoint_dir(out_dir).mkdir(parents=True, exist_ok=True)
+    identity = judge_identity(model=model, anchors=anchors, run_id=run_id)
+    items = [
+        (system, entry["thread_id"], extract(entry))
+        for entry in results["threads"]
+        for system, extract in _DRAFT_EXTRACTORS.items()
+    ]
+    _refuse_mismatched_checkpoints(out_dir, items, identity)
     per_system: dict[str, dict[int, dict[str, Any]]] = {system: {} for system in _DRAFT_EXTRACTORS}
-    for entry in results["threads"]:
-        tid = entry["thread_id"]
-        gold_label = gold[tid]
-        for system, extract in _DRAFT_EXTRACTORS.items():
-            draft = extract(entry)
-            if draft is None:
-                per_system[system][tid] = _unscorable_record("the draft step failed (R27)")
+    cache = CallCache(cache_path)
+    try:
+        caching_client = CachingClient(cache, inner=client, run_id=run_id)
+        for system, tid, draft in items:
+            path = judge_checkpoint_path(out_dir, system, tid)
+            if path.is_file():
+                per_system[system][tid] = load_checkpoint(path)["record"]
                 continue
-            result = judge_draft(
+            record = _judge_record(
                 draft,
-                category=gold_label.category,
-                escalated=gold_label.escalate,
+                gold[tid],
                 model=model,
                 anchors=anchors,
                 thread_text=threads.get(tid),
-                client=client,
+                client=caching_client,
             )
-            if isinstance(result, OutputFailure):
-                per_system[system][tid] = _unscorable_record(
-                    f"judge output {result.kind} after {result.attempts} attempts"
-                )
-            else:
-                per_system[system][tid] = _scored_record(result)
+            write_json_atomic(
+                path,
+                {
+                    "thread_id": tid,
+                    "system": system,
+                    "identity": identity,
+                    "draft_fingerprint": draft_fingerprint(draft),
+                    "record": record,
+                },
+            )
+            per_system[system][tid] = record
+    finally:
+        cache.close()
     return {
         "model": model,
         "n_threads": len(results["threads"]),

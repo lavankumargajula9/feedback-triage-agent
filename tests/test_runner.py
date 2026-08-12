@@ -40,6 +40,7 @@ from test_tools import (
 )
 
 from triage import cli
+from triage.evals.judge import judge_plan
 from triage.evals.runner import (
     CALLS_PER_THREAD,
     BaselineResult,
@@ -48,6 +49,7 @@ from triage.evals.runner import (
     baseline_user_text,
     checkpoint_path,
     completed_thread_ids,
+    format_preview,
     load_gold_labels,
     run_baseline,
     run_eval,
@@ -506,6 +508,32 @@ class TestUsageCapture:
             assert usage[arm]["cost"] == 0
             assert usage[arm]["tokens_in"] == 0
             assert usage[arm]["tokens_out"] == 0
+
+
+class TestCostPreview:
+    def test_judge_calls_are_counted_and_priced_in_the_plan(self):
+        # The operator decides to spend on this number (R32), so the judge's
+        # calls must be counted and priced, not merely mentioned.
+        # Hand-computed at measurement prices: 10 threads x 5 arm calls x
+        # ~$0.015 = $0.75; 10 threads x 2 judge calls x ~$0.05 = $1.00.
+        text = format_preview(
+            10, 10,
+            pipeline_model="claude-opus-5",
+            baseline_model="claude-opus-5",
+            profile="measurement",
+            judge=judge_plan("claude-fable-5"),
+        )
+        assert "= 50 calls" in text
+        assert "= 20 calls on claude-fable-5" in text
+        assert "~= $0.75" in text
+        assert "~= $1.00" in text
+        assert "Rough total (both arms + judge): ~$1.75" in text
+
+    def test_judge_is_absent_from_the_plan_when_not_judging(self):
+        text = format_preview(
+            10, 10, pipeline_model=MODEL, baseline_model=MODEL, profile="dev"
+        )
+        assert "judge" not in text.lower()
 
 
 @pytest.fixture

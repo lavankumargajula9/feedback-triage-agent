@@ -25,24 +25,30 @@ Hand-computed agreement example (single pooled dimension):
     kappa = 1 - 0.125/1.0 = 0.875
 """
 
+import json
+
 import pytest
 from pydantic import ValidationError
-from test_tools import FakeClient, ok, validation_error_for
+from test_tools import ExplodingClient, FakeClient, ok, validation_error_for
 
 from triage.evals.judge import (
     AGREEMENT_PROTOCOL,
     DIMENSIONS,
+    JUDGE_CALLS_PER_THREAD,
     JUDGE_STEP,
     AnchorExample,
     DimensionScore,
     JudgeResult,
     compute_agreement,
+    judge_checkpoint_path,
+    judge_cost_per_call,
     judge_draft,
     judge_system,
     judge_user_text,
+    load_anchor_stock,
     score_run,
 )
-from triage.evals.runner import GoldLabel
+from triage.evals.runner import EvalError, GoldLabel
 
 JUDGE_MODEL = "claude-fable-5"
 
@@ -120,6 +126,11 @@ def make_results(entries):
             "threads": entries}
 
 
+def score_args(tmp_path, out_name="judge-run"):
+    """Checkpoint dir + shared call cache every score_run needs (R32, KTD5)."""
+    return {"out_dir": tmp_path / out_name, "cache_path": tmp_path / "cache.db"}
+
+
 class TestSchema:
     def test_dimensions_are_exactly_r13s(self):
         assert DIMENSIONS == ("correctness", "tone", "grounding", "actionability")
@@ -179,7 +190,7 @@ class TestPrompt:
 
 
 class TestScoreRun:
-    def test_scores_both_arms_including_escalated_threads(self):
+    def test_scores_both_arms_including_escalated_threads(self, tmp_path):
         # Thread 2 is escalated (gold) and still judged for both arms (R13).
         gold = make_gold({1: ("Technical/Product", False), 2: ("Billing/Payments", True)})
         results = make_results(
@@ -190,7 +201,8 @@ class TestScoreRun:
             [ok(jr(5, 4, 4, 5, send=True)), ok(jr(2, 2, 2, 2, send=False)),
              ok(jr(3, 3, 3, 3, send=False)), ok(jr(4, 4, 4, 4, send=True))]
         )
-        run = score_run(results, gold, model=JUDGE_MODEL, anchors=[ANCHOR], client=client)
+        run = score_run(results, gold, model=JUDGE_MODEL, anchors=[ANCHOR], client=client,
+                        **score_args(tmp_path))
         pipeline = run["systems"]["pipeline"]
         # Hand-computed: thread means 4.5 and 3.0 -> mean draft score 3.75.
         assert pipeline["mean_draft_score"] == pytest.approx(3.75)
@@ -205,7 +217,7 @@ class TestScoreRun:
         escalated_call = client.messages.calls[2]
         assert "escalat" in escalated_call["messages"][0]["content"].lower()
 
-    def test_missing_draft_is_unscorable_counted_not_dropped(self):
+    def test_missing_draft_is_unscorable_counted_not_dropped(self, tmp_path):
         # AE6/R27: thread 2's pipeline draft failed -> scored at the floor,
         # kept in the denominator, and disclosed as unscorable.
         gold = make_gold({1: ("Technical/Product", False), 2: ("Technical/Product", False)})
@@ -215,7 +227,8 @@ class TestScoreRun:
         client = FakeClient(
             [ok(jr(5, 5, 5, 5)), ok(jr(3, 3, 3, 3)), ok(jr(3, 3, 3, 3))]
         )
-        run = score_run(results, gold, model=JUDGE_MODEL, anchors=[ANCHOR], client=client)
+        run = score_run(results, gold, model=JUDGE_MODEL, anchors=[ANCHOR], client=client,
+                        **score_args(tmp_path))
         pipeline = run["systems"]["pipeline"]
         assert pipeline["unscorable"] == {"count": 1, "total": 2, "rate": pytest.approx(0.5)}
         assert pipeline["mean_draft_score"] == pytest.approx(3.0)  # (5 + 1)/2
@@ -224,17 +237,177 @@ class TestScoreRun:
         assert run["systems"]["baseline"]["unscorable"]["count"] == 0
         assert len(client.messages.calls) == 3  # no judge call for the missing draft
 
-    def test_judge_output_failure_is_unscorable_counted_not_dropped(self):
+    def test_judge_output_failure_is_unscorable_counted_not_dropped(self, tmp_path):
         gold = make_gold({1: ("Technical/Product", False)})
         results = make_results([make_entry(1, "p-draft-1", "b-draft-1")])
         bad = [validation_error_for(JudgeResult, "{not json") for _ in range(3)]
         client = FakeClient(bad + [ok(jr(4, 4, 4, 4))])
-        run = score_run(results, gold, model=JUDGE_MODEL, anchors=[ANCHOR], client=client)
+        run = score_run(results, gold, model=JUDGE_MODEL, anchors=[ANCHOR], client=client,
+                        **score_args(tmp_path))
         pipeline = run["systems"]["pipeline"]
         assert pipeline["unscorable"] == {"count": 1, "total": 1, "rate": 1.0}
         assert pipeline["mean_draft_score"] == pytest.approx(1.0)  # floor, in denominator
         assert run["systems"]["baseline"]["unscorable"]["count"] == 0
         assert run["systems"]["baseline"]["mean_draft_score"] == pytest.approx(4.0)
+
+
+TWO_THREADS = make_results(
+    [make_entry(1, "p-draft-1", "b-draft-1"), make_entry(2, "p-draft-2", "b-draft-2")]
+)
+TWO_GOLD = make_gold({1: ("Technical/Product", False), 2: ("Billing/Payments", True)})
+FOUR_SCORES = [ok(jr(5, 4, 4, 5)), ok(jr(2, 2, 2, 2)), ok(jr(3, 3, 3, 3)), ok(jr(4, 4, 4, 4))]
+
+
+def score(results, gold, client, args, **extra):
+    return score_run(
+        results, gold, model=JUDGE_MODEL, anchors=[ANCHOR], client=client, **args, **extra
+    )
+
+
+class TestJudgeCheckpointResume:
+    """R32/KTD5 applied to the judge — the priciest calls in the system."""
+
+    def test_mid_run_crash_leaves_a_resumable_checkpoint(self, tmp_path):
+        # The crash lands on thread 1's baseline draft, after its pipeline
+        # draft was already paid for and checkpointed.
+        args = score_args(tmp_path)
+        failing = FakeClient([ok(jr(5, 4, 4, 5)), RuntimeError("simulated transport failure")])
+        with pytest.raises(RuntimeError, match="transport"):
+            score(TWO_THREADS, TWO_GOLD, failing, args)
+        assert judge_checkpoint_path(args["out_dir"], "pipeline", 1).is_file()
+        assert not judge_checkpoint_path(args["out_dir"], "baseline", 1).is_file()
+
+        resumed = FakeClient(list(FOUR_SCORES))
+        run = score(TWO_THREADS, TWO_GOLD, resumed, args)
+        # The money assertion: the already-scored item is NOT re-called.
+        assert len(resumed.messages.calls) == 3
+        assert run["systems"]["pipeline"]["per_thread"][1]["mean"] == pytest.approx(4.5)
+
+    def test_resumed_scores_match_an_uninterrupted_run(self, tmp_path):
+        args = score_args(tmp_path)
+        failing = FakeClient([ok(jr(5, 4, 4, 5)), RuntimeError("boom")])
+        with pytest.raises(RuntimeError):
+            score(TWO_THREADS, TWO_GOLD, failing, args)
+        resumed = score(TWO_THREADS, TWO_GOLD, FakeClient(list(FOUR_SCORES)), args)
+        fresh = score(
+            TWO_THREADS,
+            TWO_GOLD,
+            FakeClient(list(FOUR_SCORES)),
+            score_args(tmp_path, out_name="fresh"),
+        )
+        assert resumed["systems"] == fresh["systems"]
+
+    def test_checkpoint_from_a_different_judge_model_is_refused(self, tmp_path):
+        args = score_args(tmp_path)
+        score(TWO_THREADS, TWO_GOLD, FakeClient(list(FOUR_SCORES)), args)
+        with pytest.raises(EvalError, match="judge_model"):
+            score_run(
+                TWO_THREADS, TWO_GOLD, model="claude-opus-5", anchors=[ANCHOR],
+                client=FakeClient(list(FOUR_SCORES)), **args,
+            )
+
+    def test_checkpoint_from_a_different_judge_prompt_is_refused(self, tmp_path):
+        # R14: the anchor stock is part of the judge; swapping it changes what
+        # produced the scores, so the old checkpoints cannot be mixed in.
+        args = score_args(tmp_path)
+        score(TWO_THREADS, TWO_GOLD, FakeClient(list(FOUR_SCORES)), args)
+        other = AnchorExample(
+            item_id="anchor-2", category="Billing/Payments", draft="A different anchor draft.",
+            scores=dict(ANCHOR.scores), critiques=dict(ANCHOR.critiques), send_as_is=False,
+        )
+        with pytest.raises(EvalError, match="judge_prompt_hash"):
+            score_run(
+                TWO_THREADS, TWO_GOLD, model=JUDGE_MODEL, anchors=[other],
+                client=FakeClient(list(FOUR_SCORES)), **args,
+            )
+
+    def test_checkpoint_scored_from_a_different_draft_is_refused(self, tmp_path):
+        args = score_args(tmp_path)
+        score(TWO_THREADS, TWO_GOLD, FakeClient(list(FOUR_SCORES)), args)
+        redrafted = make_results(
+            [make_entry(1, "a completely rewritten draft", "b-draft-1"),
+             make_entry(2, "p-draft-2", "b-draft-2")]
+        )
+        with pytest.raises(EvalError, match="thread 1"):
+            score(redrafted, TWO_GOLD, FakeClient(list(FOUR_SCORES)), args)
+
+    def test_checkpoint_records_what_produced_it(self, tmp_path):
+        args = score_args(tmp_path)
+        score(TWO_THREADS, TWO_GOLD, FakeClient(list(FOUR_SCORES)), args)
+        entry = json.loads(
+            judge_checkpoint_path(args["out_dir"], "pipeline", 1).read_text(encoding="utf-8")
+        )
+        assert entry["identity"]["judge_model"] == JUDGE_MODEL
+        assert entry["identity"]["judge_prompt_hash"]
+        assert entry["identity"]["run_id"] == ""
+        assert entry["draft_fingerprint"]
+        assert entry["record"]["mean"] == pytest.approx(4.5)
+
+    def test_replay_through_the_cache_makes_zero_live_calls(self, tmp_path):
+        # KTD5: a second run with fresh checkpoints but the same cache replays
+        # every judge call for free — the client is never touched.
+        args = score_args(tmp_path)
+        score(TWO_THREADS, TWO_GOLD, FakeClient(list(FOUR_SCORES)), args)
+        replay_args = {**args, "out_dir": tmp_path / "replay"}
+        replayed = score(TWO_THREADS, TWO_GOLD, ExplodingClient(), replay_args)
+        assert replayed["systems"]["pipeline"]["mean_draft_score"] == pytest.approx(3.75)
+
+    def test_run_id_salt_bypasses_prior_cache_entries(self, tmp_path):
+        # R21 variance passes: a salted run must not replay the unsalted one.
+        args = score_args(tmp_path)
+        score(TWO_THREADS, TWO_GOLD, FakeClient(list(FOUR_SCORES)), args)
+        salted = FakeClient(list(FOUR_SCORES))
+        score(TWO_THREADS, TWO_GOLD, salted, {**args, "out_dir": tmp_path / "v2"},
+              run_id="variance-1")
+        assert len(salted.messages.calls) == 4
+
+
+class TestJudgeCostPlan:
+    def test_judge_calls_are_per_thread_per_arm(self):
+        assert JUDGE_CALLS_PER_THREAD == 2
+
+    def test_judge_model_is_priced(self):
+        # The operator decides to spend based on this number, so the judge
+        # model must not price as "unknown" (plan: ~$0.05/call on Fable 5).
+        assert judge_cost_per_call(JUDGE_MODEL) == pytest.approx(0.05)
+
+
+class TestAnchorStock:
+    def test_load_anchor_stock_round_trips(self, tmp_path):
+        path = tmp_path / "anchors.json"
+        path.write_text(
+            json.dumps([
+                {
+                    "item_id": ANCHOR.item_id,
+                    "category": ANCHOR.category,
+                    "draft": ANCHOR.draft,
+                    "scores": dict(ANCHOR.scores),
+                    "critiques": dict(ANCHOR.critiques),
+                    "send_as_is": ANCHOR.send_as_is,
+                }
+            ]),
+            encoding="utf-8",
+        )
+        anchors = load_anchor_stock(path)
+        assert [a.item_id for a in anchors] == ["anchor-1"]
+        assert judge_system(anchors) == judge_system([ANCHOR])
+
+    def test_missing_anchor_file_names_the_labeling_pass(self, tmp_path):
+        with pytest.raises(EvalError, match="anchor stock"):
+            load_anchor_stock(tmp_path / "absent.json")
+
+    def test_anchor_missing_a_dimension_score_is_rejected(self, tmp_path):
+        path = tmp_path / "anchors.json"
+        path.write_text(
+            json.dumps([{
+                "item_id": "a", "category": "Billing/Payments", "draft": "d",
+                "scores": {"correctness": 5}, "critiques": dict(ANCHOR.critiques),
+                "send_as_is": True,
+            }]),
+            encoding="utf-8",
+        )
+        with pytest.raises(EvalError, match="tone"):
+            load_anchor_stock(path)
 
 
 class TestAgreement:

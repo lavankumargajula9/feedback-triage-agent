@@ -233,8 +233,20 @@ def format_preview(
     baseline_model: str,
     profile: str,
     run_id: str = "",
+    judge: Mapping[str, Any] | None = None,
 ) -> str:
-    """The planned-call-count and rough-cost preview printed BEFORE executing (R32)."""
+    """The planned-call-count and rough-cost preview printed BEFORE executing (R32).
+
+    ``judge`` is :func:`triage.evals.judge.judge_plan` when judging is enabled:
+    judge calls cost several times a pipeline step, and the operator decides to
+    spend on this number, so they are counted and priced here or not at all.
+    """
+    arms_cost = _arms_cost(
+        remaining * PIPELINE_CALLS_PER_THREAD,
+        pipeline_model,
+        remaining * BASELINE_CALLS_PER_THREAD,
+        baseline_model,
+    )
     lines = [
         (
             f"Eval plan (R32): {remaining} of {total} threads to run "
@@ -256,11 +268,51 @@ def format_preview(
             baseline_model,
         ),
     ]
+    if judge is not None:
+        lines.extend(_judge_preview_lines(remaining, judge, arms_cost))
     if run_id:
         lines.append(
             f"Run-id salt {run_id!r}: prior cache entries are bypassed for this run (KTD5)."
         )
     return "\n".join(lines)
+
+
+def _arms_cost(
+    pipeline_calls: int, pipeline_model: str, baseline_calls: int, baseline_model: str
+) -> float | None:
+    """Rough dollars for both arms, or None when either model has no price."""
+    pipeline_cost = cost_per_call(pipeline_model)
+    baseline_cost = cost_per_call(baseline_model)
+    if pipeline_cost is None or baseline_cost is None:
+        return None
+    return pipeline_calls * pipeline_cost + baseline_calls * baseline_cost
+
+
+def _judge_preview_lines(
+    remaining: int, judge: Mapping[str, Any], arms_cost: float | None
+) -> list[str]:
+    """The judge's share of the preview, priced separately then totaled (R13)."""
+    calls = remaining * judge["calls_per_thread"]
+    cost_per_judge_call = judge["cost_per_call"]
+    lines = [
+        (
+            f"Judge calls (R13): {remaining} threads x {judge['calls_per_thread']} "
+            f"calls/thread (pipeline + baseline drafts) = {calls} calls on "
+            f"{judge['model']}"
+        )
+    ]
+    if cost_per_judge_call is None:
+        lines.append(f"Rough judge cost: unknown (no pricing on file for {judge['model']!r})")
+        return lines
+    judge_cost = calls * cost_per_judge_call
+    lines.append(
+        f"Rough judge cost: {calls} calls x ~${cost_per_judge_call:.4f} "
+        f"(~{judge['tokens_in']} in / ~{judge['tokens_out']} out tokens per call) "
+        f"~= ${judge_cost:.2f}; cache hits cost $0"
+    )
+    if arms_cost is not None:
+        lines.append(f"Rough total (both arms + judge): ~${arms_cost + judge_cost:.2f}")
+    return lines
 
 
 def _cost_line(
@@ -309,12 +361,12 @@ def thread_fingerprint(thread: Thread) -> str:
     ``render_thread`` is the single rendering every surface uses, so this
     fingerprint moves whenever ingest changes what the model would see.
     """
-    return _sha256_text(render_thread(thread))
+    return sha256_text(render_thread(thread))
 
 
 def threads_digest(fingerprints: Mapping[int, str]) -> str:
     """One digest over every thread's fingerprint, recorded in the results file."""
-    return _sha256_text(
+    return sha256_text(
         "\n".join(f"{tid}:{fingerprints[tid]}" for tid in sorted(fingerprints))
     )
 
@@ -337,7 +389,15 @@ def run_identity(
     }
 
 
-def _identity_mismatch(expected: dict[str, Any], found: Any) -> str | None:
+def load_checkpoint(path: Path) -> dict[str, Any]:
+    """One checkpoint's payload; an unreadable file is an EvalError, not a crash."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EvalError(f"cannot read checkpoint {path}: {exc}") from None
+
+
+def identity_mismatch(expected: dict[str, Any], found: Any) -> str | None:
     """The first field where a checkpoint's identity differs, or None."""
     if not isinstance(found, dict):
         return "identity (checkpoint predates identity stamping)"
@@ -373,11 +433,8 @@ def _check_checkpoint_identity(
         path = checkpoint_path(out_dir, thread_id)
         if not path.is_file():
             continue
-        try:
-            entry = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise EvalError(f"cannot read checkpoint {path}: {exc}") from None
-        field = _identity_mismatch(expected, entry.get("identity"))
+        entry = load_checkpoint(path)
+        field = identity_mismatch(expected, entry.get("identity"))
         if field is not None:
             raise EvalError(
                 f"checkpoint {path} was produced by a different run ({field} differs); "
@@ -406,7 +463,7 @@ def resume_instruction(out_dir: Path | str) -> str:
     )
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     """Write-then-rename so an interrupted write never leaves a torn checkpoint."""
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -478,7 +535,7 @@ def run_eval(
                 },
                 "ok": pipeline_result["ok"] and "failure" not in baseline,
             }
-            _write_json_atomic(checkpoint_path(out_dir, thread_id), entry)
+            write_json_atomic(checkpoint_path(out_dir, thread_id), entry)
             done.add(thread_id)
     finally:
         cache.close()
@@ -490,7 +547,7 @@ def run_eval(
 # ---------------------------------------------------------------------------
 
 
-def _sha256_text(text: str) -> str:
+def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -501,11 +558,11 @@ def prompt_hashes() -> dict[str, str]:
     control is pinned model ids + these hashes + measured variance.
     """
     return {
-        "categorize": _sha256_text(fragments.step_system(fragments.CATEGORIZE_INSTRUCTIONS)),
-        "route": _sha256_text(fragments.step_system(fragments.ROUTE_INSTRUCTIONS)),
-        "escalate": _sha256_text(fragments.step_system(fragments.ESCALATE_INSTRUCTIONS)),
-        "draft": _sha256_text(fragments.step_system(fragments.DRAFT_INSTRUCTIONS)),
-        "baseline": _sha256_text(baseline_system()),
+        "categorize": sha256_text(fragments.step_system(fragments.CATEGORIZE_INSTRUCTIONS)),
+        "route": sha256_text(fragments.step_system(fragments.ROUTE_INSTRUCTIONS)),
+        "escalate": sha256_text(fragments.step_system(fragments.ESCALATE_INSTRUCTIONS)),
+        "draft": sha256_text(fragments.step_system(fragments.DRAFT_INSTRUCTIONS)),
+        "baseline": sha256_text(baseline_system()),
     }
 
 
@@ -581,5 +638,5 @@ def write_results(
         "threads": entries,
     }
     path = out_dir / RESULTS_FILENAME
-    _write_json_atomic(path, results)
+    write_json_atomic(path, results)
     return path

@@ -42,9 +42,10 @@ RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 529})
 # One sleep per retry; len(BACKOFF_SECONDS) == number of transport retries.
 BACKOFF_SECONDS = (1.0, 2.0)
 
-# (input $/MTok, output $/MTok) per model id used by draft roles.
+# (input $/MTok, output $/MTok) per model id used by any role (R30, R22).
 PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-opus-5": (5.0, 25.0),
+    "claude-fable-5": (10.0, 50.0),
     "claude-haiku-4-5": (1.0, 5.0),
 }
 
