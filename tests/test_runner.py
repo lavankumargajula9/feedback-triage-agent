@@ -250,6 +250,67 @@ class TestRunnerCheckpointsAndResume:
         assert entry["pipeline"]["failed_steps"] == ["categorize"]
         assert entry["baseline"]["category"]  # baseline arm still recorded
 
+    def test_resume_refuses_when_the_model_changed(self, tmp_path):
+        # A results file is only honest if every checkpoint in it came from the
+        # same models and prompts. Resuming a run into an out_dir whose
+        # checkpoints were produced by a different model must refuse, not
+        # silently mix arms and stamp `complete: true` with the new model ids.
+        threads = make_threads(3)
+        args = run_args(tmp_path)
+        failing = FakeClient(
+            list(PER_THREAD_OUTCOMES) + [RuntimeError("simulated transport failure")]
+        )
+        with pytest.raises(RuntimeError, match="transport"):
+            run_eval(threads, client=failing, **args)
+        assert completed_thread_ids(args["out_dir"]) == {1}
+
+        measurement_args = {**args, "pipeline_model": "claude-opus-5"}
+        with pytest.raises(EvalError, match="pipeline_model"):
+            run_eval(threads, client=happy_client(3), **measurement_args)
+
+    def test_resume_refuses_when_a_prompt_changed(self, tmp_path):
+        # Same hazard via frozen prompts rather than model ids (KTD5).
+        threads = make_threads(1)
+        args = run_args(tmp_path)
+        run_eval(threads, client=happy_client(1), **args)
+        entry = json.loads(checkpoint_path(args["out_dir"], 1).read_text(encoding="utf-8"))
+        entry["identity"]["prompt_hashes"]["categorize"] = "stale-hash"
+        checkpoint_path(args["out_dir"], 1).write_text(json.dumps(entry), encoding="utf-8")
+        with pytest.raises(EvalError, match="prompt_hashes"):
+            run_eval(threads, client=happy_client(1), **args)
+
+    def test_write_results_refuses_identity_mismatched_checkpoints(self, tmp_path):
+        # Defense in depth: even if a mismatched checkpoint reaches disk, the
+        # results file must not be stamped with models that do not describe it.
+        threads = make_threads(1)
+        args = run_args(tmp_path)
+        run_eval(threads, client=happy_client(1), **args)
+        labels_path = write_labels(
+            tmp_path / "gold.csv", ["1,Technical/Product,Technical/Product,false"]
+        )
+        with pytest.raises(EvalError, match="pipeline_model"):
+            write_results(
+                args["out_dir"],
+                list(threads),
+                labels_path=labels_path,
+                profile="measurement",
+                pipeline_model="claude-opus-5",
+                baseline_model=MODEL,
+            )
+        assert not (args["out_dir"] / "results.json").exists()
+
+    def test_resume_proceeds_when_identity_matches(self, tmp_path):
+        # The guard must not break the ordinary resume path.
+        threads = make_threads(3)
+        args = run_args(tmp_path)
+        failing = FakeClient(
+            list(PER_THREAD_OUTCOMES) + [RuntimeError("simulated transport failure")]
+        )
+        with pytest.raises(RuntimeError):
+            run_eval(threads, client=failing, **args)
+        summary = run_eval(threads, client=FakeClient(list(PER_THREAD_OUTCOMES) * 2), **args)
+        assert summary == {"completed": 3, "total": 3}
+
     def test_write_results_refuses_incomplete_run(self, tmp_path):
         threads = make_threads(3)
         args = run_args(tmp_path)

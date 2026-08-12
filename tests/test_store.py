@@ -75,6 +75,59 @@ class TestLoadCsv:
         assert load_tweets_csv(empty) == {}
 
 
+class TestReIngest:
+    """Ingest must be re-runnable, and thread ids must survive it.
+
+    Gold labels key on ``thread_id``, so a re-ingest that renumbered threads
+    would silently repoint frozen labels at different conversations — the
+    published numbers would describe the wrong threads.
+    """
+
+    def test_second_ingest_of_the_same_csv_succeeds(self, tmp_path):
+        db_path = tmp_path / "store.db"
+        first = ingest_csv(FIXTURE_CSV, db_path)
+        second = ingest_csv(FIXTURE_CSV, db_path)
+        assert second == first
+
+    def test_thread_ids_are_stable_across_re_ingest(self, tmp_path):
+        db_path = tmp_path / "store.db"
+        ingest_csv(FIXTURE_CSV, db_path)
+        conn = open_store(db_path)
+        try:
+            before = {
+                row["thread_id"]: (row["root_tweet_id"], row["customer_author_id"])
+                for row in conn.execute(
+                    "SELECT thread_id, root_tweet_id, customer_author_id FROM threads"
+                )
+            }
+        finally:
+            conn.close()
+        ingest_csv(FIXTURE_CSV, db_path)
+        conn = open_store(db_path)
+        try:
+            after = {
+                row["thread_id"]: (row["root_tweet_id"], row["customer_author_id"])
+                for row in conn.execute(
+                    "SELECT thread_id, root_tweet_id, customer_author_id FROM threads"
+                )
+            }
+        finally:
+            conn.close()
+        assert after == before
+
+    def test_re_ingest_does_not_duplicate_thread_membership(self, tmp_path):
+        db_path = tmp_path / "store.db"
+        ingest_csv(FIXTURE_CSV, db_path)
+        ingest_csv(FIXTURE_CSV, db_path)
+        conn = open_store(db_path)
+        try:
+            (thread_id,) = thread_ids_for_tweet(conn, 1)
+            thread = get_thread(conn, thread_id)
+            assert [t.tweet_id for t in thread.tweets] == [1, 2, 3, 4]
+        finally:
+            conn.close()
+
+
 class TestIngestEndToEnd:
     def test_stats(self, store_conn):
         _, stats = store_conn

@@ -24,6 +24,7 @@ import csv
 import hashlib
 import json
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -308,6 +309,56 @@ def completed_thread_ids(out_dir: Path | str) -> set[int]:
     return {int(p.stem) for p in directory.glob("*.json") if p.stem.isdigit()}
 
 
+def run_identity(
+    *, pipeline_model: str, baseline_model: str, run_id: str = ""
+) -> dict[str, Any]:
+    """What a checkpoint must have been produced by to belong to this run (KTD5).
+
+    Stamped into every checkpoint and re-checked on resume. A results file is
+    only honest if all of its checkpoints came from the same models, prompts,
+    and run-id salt — mixing them would stamp `complete: true` on outputs the
+    recorded model ids do not describe.
+    """
+    return {
+        "pipeline_model": pipeline_model,
+        "baseline_model": baseline_model,
+        "run_id": run_id,
+        "prompt_hashes": prompt_hashes(),
+    }
+
+
+def _identity_mismatch(expected: dict[str, Any], found: Any) -> str | None:
+    """The first field where a checkpoint's identity differs, or None."""
+    if not isinstance(found, dict):
+        return "identity (checkpoint predates identity stamping)"
+    for field, want in expected.items():
+        if found.get(field) != want:
+            return field
+    return None
+
+
+def _check_checkpoint_identity(
+    out_dir: Path, thread_ids: Iterable[int], expected: dict[str, Any]
+) -> None:
+    """Raise EvalError if any existing checkpoint came from a different run."""
+    for thread_id in thread_ids:
+        path = checkpoint_path(out_dir, thread_id)
+        if not path.is_file():
+            continue
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise EvalError(f"cannot read checkpoint {path}: {exc}") from None
+        field = _identity_mismatch(expected, entry.get("identity"))
+        if field is not None:
+            raise EvalError(
+                f"checkpoint {path} was produced by a different run ({field} differs); "
+                "mixing runs would report results the recorded model ids do not "
+                "describe. Use a fresh --out directory for this configuration, or "
+                "delete that directory to re-run it from scratch."
+            )
+
+
 def resume_instruction(out_dir: Path | str) -> str:
     """How to resume a partial run (printed on every nonzero partial exit, R32)."""
     return (
@@ -353,6 +404,11 @@ def run_eval(
     out_dir = Path(out_dir)
     checkpoint_dir(out_dir).mkdir(parents=True, exist_ok=True)
     done = completed_thread_ids(out_dir)
+    identity = run_identity(
+        pipeline_model=pipeline_model, baseline_model=baseline_model, run_id=run_id
+    )
+    # Refuse before spending anything if this out_dir holds another run's work.
+    _check_checkpoint_identity(out_dir, sorted(done), identity)
     cache = CallCache(cache_path)
     try:
         caching_client = CachingClient(cache, inner=client, run_id=run_id)
@@ -369,6 +425,7 @@ def run_eval(
             entry = {
                 "thread_id": thread_id,
                 "run_id": run_id,
+                "identity": identity,
                 "pipeline": pipeline_result,
                 "baseline": baseline,
                 "ok": pipeline_result["ok"] and "failure" not in baseline,
@@ -436,6 +493,14 @@ def write_results(
             f"(missing thread ids: {shown}{suffix}); metrics are computed only from "
             f"100%-complete runs (R32) — {resume_instruction(out_dir)}"
         )
+    # Defense in depth (R32): never stamp models onto outputs they did not produce.
+    _check_checkpoint_identity(
+        out_dir,
+        thread_ids,
+        run_identity(
+            pipeline_model=pipeline_model, baseline_model=baseline_model, run_id=run_id
+        ),
+    )
     entries = [
         json.loads(checkpoint_path(out_dir, tid).read_text(encoding="utf-8"))
         for tid in thread_ids

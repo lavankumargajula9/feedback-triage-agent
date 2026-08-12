@@ -182,6 +182,21 @@ class TestRunInput:
 
 
 class TestBatch:
+    def test_batch_file_with_a_single_tweet_id_is_accepted(self, sample_db, tmp_path, capsys):
+        # A one-line batch file parses as bare JSON (the int 1), so it must not
+        # be rejected as "not a non-empty array".
+        batch_path = tmp_path / "batch.txt"
+        batch_path.write_text("1\n", encoding="utf-8")
+        client = FakeClient(list(HAPPY_OUTCOMES))
+        code, out, err = run_cli(
+            ["run", "--batch", str(batch_path), "--db", str(sample_db)], capsys, client=client
+        )
+        assert code == 0, err
+        entries = json.loads(out)
+        assert len(entries) == 1
+        assert entries[0]["input"] == 1
+        assert entries[0]["result"]["steps"]["categorize"]["label"] == "Technical/Product"
+
     def test_batch_continues_past_poisoned_thread_and_exits_nonzero(
         self, sample_db, tmp_path, capsys
     ):

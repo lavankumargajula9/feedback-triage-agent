@@ -133,6 +133,39 @@ def open_store(db_path: Path | str) -> sqlite3.Connection:
     return conn
 
 
+def _upsert_thread(conn: sqlite3.Connection, thread: Thread) -> int:
+    """Return this thread's stable id, inserting it only if it is new.
+
+    A thread's identity is (root_tweet_id, customer_author_id). Re-ingesting
+    keeps the existing ``thread_id`` for an identity already in the store, so
+    frozen gold labels — which key on ``thread_id`` — keep pointing at the same
+    conversation across re-ingests.
+    """
+    row = conn.execute(
+        "SELECT thread_id FROM threads "
+        "WHERE root_tweet_id = ? AND IFNULL(customer_author_id, '') = IFNULL(?, '')",
+        (thread.root_tweet_id, thread.customer_author_id),
+    ).fetchone()
+    if row is None:
+        cursor = conn.execute(
+            "INSERT INTO threads (root_tweet_id, customer_author_id, truncated, cycle_flagged) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                thread.root_tweet_id,
+                thread.customer_author_id,
+                int(thread.truncated),
+                int(thread.cycle_flagged),
+            ),
+        )
+        return int(cursor.lastrowid)
+    thread_id = int(row["thread_id"])
+    conn.execute(
+        "UPDATE threads SET truncated = ?, cycle_flagged = ? WHERE thread_id = ?",
+        (int(thread.truncated), int(thread.cycle_flagged), thread_id),
+    )
+    return thread_id
+
+
 def ingest_tweets(conn: sqlite3.Connection, tweets: dict[int, Tweet]) -> dict[str, int]:
     """Write tweets and their reconstructed threads; return summary counts."""
     conn.executemany(
@@ -150,23 +183,20 @@ def ingest_tweets(conn: sqlite3.Connection, tweets: dict[int, Tweet]) -> dict[st
         ),
     )
     threads = reconstruct_all(tweets)
-    for thread in threads:
-        cursor = conn.execute(
-            "INSERT INTO threads (root_tweet_id, customer_author_id, truncated, cycle_flagged) "
-            "VALUES (?, ?, ?, ?)",
-            (
-                thread.root_tweet_id,
-                thread.customer_author_id,
-                int(thread.truncated),
-                int(thread.cycle_flagged),
-            ),
-        )
-        thread_id = cursor.lastrowid
-        conn.executemany(
-            "INSERT INTO thread_tweets (thread_id, position, tweet_id) VALUES (?, ?, ?)",
-            ((thread_id, pos, tid) for pos, tid in enumerate(thread.tweet_ids)),
-        )
-    conn.commit()
+    try:
+        for thread in threads:
+            thread_id = _upsert_thread(conn, thread)
+            # Membership is rewritten wholesale so a re-ingest cannot accumulate
+            # duplicate or stale positions for a thread that changed shape.
+            conn.execute("DELETE FROM thread_tweets WHERE thread_id = ?", (thread_id,))
+            conn.executemany(
+                "INSERT INTO thread_tweets (thread_id, position, tweet_id) VALUES (?, ?, ?)",
+                ((thread_id, pos, tid) for pos, tid in enumerate(thread.tweet_ids)),
+            )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.rollback()
+        raise IngestError(f"Could not write reconstructed threads: {exc}") from exc
     return {
         "tweets": len(tweets),
         "threads": len(threads),

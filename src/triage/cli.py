@@ -354,6 +354,10 @@ def _load_batch_items(path: Path) -> list[Any]:
         if not items:
             raise InputError(f"batch file {path} is empty")
         return items
+    if isinstance(payload, int):
+        # A one-line batch file holding a single tweet id parses as bare JSON
+        # before the newline path above ever runs.
+        return [payload]
     if not isinstance(payload, list) or not payload:
         raise InputError(
             "batch JSON must be a non-empty array of tweet ids and/or message objects"
