@@ -188,6 +188,27 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print the planned call count and rough cost, then execute nothing",
     )
+    evaluate.add_argument(
+        "--regression",
+        type=Path,
+        default=None,
+        metavar="REFERENCE",
+        help=(
+            "after the run completes, check the gated metrics against this recorded "
+            "reference artifact (R15); fails naming the metric, hard-warns on "
+            "environment drift"
+        ),
+    )
+    evaluate.add_argument(
+        "--record-reference",
+        type=Path,
+        default=None,
+        metavar="REFERENCE",
+        help=(
+            "after the run completes, record the reference artifact here — the ONLY "
+            "way a reference is ever recorded (KTD10)"
+        ),
+    )
     return parser
 
 
@@ -516,6 +537,45 @@ def _cmd_eval(args: argparse.Namespace, client: Any = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_PIPELINE_FAILURE
     print(f"Results: {results_path}")
+    if args.record_reference is None and args.regression is None:
+        return EXIT_OK
+    return _eval_reference_and_regression(args, results_path, labels)
+
+
+def _eval_reference_and_regression(args: argparse.Namespace, results_path: Path, labels) -> int:
+    """Record and/or check the reference AFTER a complete run (R15, KTD10)."""
+    from triage.evals import regression
+    from triage.evals.metrics import compute_report
+
+    results = json.loads(Path(results_path).read_text(encoding="utf-8"))
+    gated = regression.gated_metrics(compute_report(results, labels))
+    if args.record_reference is not None:
+        # KTD10: this explicit flag is the ONLY path that records a reference.
+        reference_path = regression.record_reference(
+            results, gated, path=args.record_reference
+        )
+        print(f"Reference recorded: {reference_path}")
+    if args.regression is None:
+        return EXIT_OK
+    try:
+        reference = regression.load_reference(args.regression)
+    except regression.RegressionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_ERROR
+    check = regression.check_regression(
+        gated, reference, current_env=regression.environment_of(results)
+    )
+    # Hard environment-drift warnings, distinct from metric failures (R15).
+    for warning in check["drift"]:
+        print(f"WARNING: {warning}", file=sys.stderr)
+    for failure in check["failures"]:
+        print(f"error: {failure['message']}", file=sys.stderr)
+    if not check["ok"]:
+        return EXIT_PIPELINE_FAILURE
+    print(
+        f"Regression check passed: {len(check['checked'])} gated metrics within "
+        f"tolerance of {args.regression}"
+    )
     return EXIT_OK
 
 
