@@ -1,0 +1,427 @@
+"""Tests for the eval runner and `triage eval` CLI (U7) — R8, R30, R32, KTD5.
+
+Covers:
+- Gold-labels loader (U6 data integrity enforced here): CSV schema, label-set
+  membership against the single-sourced taxonomy, no duplicate thread ids.
+- Baseline arm (R8): ONE call producing all four outputs, its prompt assembled
+  from the SAME shared fragments the pipeline steps use (equal information);
+  degenerate threads short-circuit with zero LLM calls; persistent bad output
+  becomes a typed OutputFailure that is recorded, never raised.
+- Runner (R32, KTD5): per-thread checkpoints, a mid-run failure leaves a
+  resumable run, resume never re-calls completed threads, results files are
+  written only for 100%-complete runs and record model ids + prompt hashes +
+  eval-set hash.
+- CLI `triage eval`: cost preview printed BEFORE executing, --dry-run executes
+  nothing, incomplete run exits nonzero with a resume instruction.
+
+Every test is fully mocked and in-process: zero network, no real client.
+"""
+
+import json
+
+import pytest
+from test_tools import (
+    CATEGORIZED,
+    DRAFTED,
+    ESCALATED,
+    FIXTURE_CSV,
+    ROUTED,
+    ExplodingClient,
+    FakeClient,
+    make_thread,
+    ok,
+    validation_error_for,
+)
+
+from triage import cli
+from triage.evals.runner import (
+    CALLS_PER_THREAD,
+    BaselineResult,
+    EvalError,
+    baseline_system,
+    baseline_user_text,
+    checkpoint_path,
+    completed_thread_ids,
+    load_gold_labels,
+    run_baseline,
+    run_eval,
+    write_results,
+)
+from triage.ingest.store import ingest_csv, open_store
+from triage.prompts import fragments
+from triage.tools import OutputFailure
+from triage.tools.retrieval import build_user_text, search_threads
+
+MODEL = "claude-haiku-4-5"
+
+BASE = BaselineResult(
+    category="Technical/Product",
+    queue="Technical/Product",
+    escalate=False,
+    escalate_reason="Routine technical issue.",
+    draft="So sorry about that — we're on it!",
+)
+
+# One thread's worth of outcomes in runner call order:
+# pipeline (categorize, route, escalate, draft) then baseline.
+PER_THREAD_OUTCOMES = [ok(CATEGORIZED), ok(ROUTED), ok(ESCALATED), ok(DRAFTED), ok(BASE)]
+
+LABEL_HEADER = "thread_id,category,queue,escalate\n"
+
+
+def make_threads(count):
+    """Distinct, diagnosable synthetic threads keyed by thread id."""
+    return {
+        i: make_thread(
+            [f"@brand my order number {1000 + i} arrived broken and shows error code {i}"]
+        )
+        for i in range(1, count + 1)
+    }
+
+
+def write_labels(path, rows):
+    path.write_text(LABEL_HEADER + "".join(f"{r}\n" for r in rows), encoding="utf-8")
+    return path
+
+
+def happy_client(thread_count):
+    return FakeClient(list(PER_THREAD_OUTCOMES) * thread_count)
+
+
+def run_args(tmp_path):
+    return {
+        "out_dir": tmp_path / "run",
+        "cache_path": tmp_path / "cache.db",
+        "pipeline_model": MODEL,
+        "baseline_model": MODEL,
+    }
+
+
+class TestGoldLabelsLoader:
+    def test_valid_labels_load(self, tmp_path):
+        path = write_labels(
+            tmp_path / "gold.csv",
+            [
+                "1,Technical/Product,Technical/Product,true",
+                "2,Billing/Payments,Billing/Payments,false",
+            ],
+        )
+        labels = load_gold_labels(path)
+        assert set(labels) == {1, 2}
+        assert labels[1].escalate is True
+        assert labels[2].category == "Billing/Payments"
+
+    def test_off_taxonomy_category_is_rejected(self, tmp_path):
+        path = write_labels(
+            tmp_path / "gold.csv", ["1,Weather,Technical/Product,false"]
+        )
+        with pytest.raises(EvalError, match="Weather"):
+            load_gold_labels(path)
+
+    def test_off_taxonomy_queue_is_rejected(self, tmp_path):
+        path = write_labels(
+            tmp_path / "gold.csv", ["1,Technical/Product,Weather,false"]
+        )
+        with pytest.raises(EvalError, match="Weather"):
+            load_gold_labels(path)
+
+    def test_duplicate_thread_id_is_rejected(self, tmp_path):
+        path = write_labels(
+            tmp_path / "gold.csv",
+            [
+                "1,Technical/Product,Technical/Product,false",
+                "1,Billing/Payments,Billing/Payments,true",
+            ],
+        )
+        with pytest.raises(EvalError, match="[Dd]uplicate"):
+            load_gold_labels(path)
+
+    def test_missing_column_is_rejected(self, tmp_path):
+        path = tmp_path / "gold.csv"
+        path.write_text("thread_id,category\n1,Technical/Product\n", encoding="utf-8")
+        with pytest.raises(EvalError, match="queue"):
+            load_gold_labels(path)
+
+    def test_bad_escalate_value_is_rejected(self, tmp_path):
+        path = write_labels(
+            tmp_path / "gold.csv", ["1,Technical/Product,Technical/Product,maybe"]
+        )
+        with pytest.raises(EvalError, match="escalate"):
+            load_gold_labels(path)
+
+    def test_missing_file_gives_instructive_error(self, tmp_path):
+        with pytest.raises(EvalError, match="thread_id"):
+            load_gold_labels(tmp_path / "absent.csv")
+
+    def test_utf8_bom_is_tolerated(self, tmp_path):
+        # Labeling tools on Windows (Excel, PowerShell) write a UTF-8 BOM.
+        path = tmp_path / "gold.csv"
+        path.write_text(
+            LABEL_HEADER + "1,Technical/Product,Technical/Product,false\n",
+            encoding="utf-8-sig",
+        )
+        assert set(load_gold_labels(path)) == {1}
+
+
+class TestBaselineArm:
+    def test_baseline_prompt_reuses_the_shared_fragments(self):
+        # R8: equal information — the same preamble, the same taxonomy text,
+        # and the same four step-instruction fragments the pipeline uses.
+        system = baseline_system()
+        assert fragments.SYSTEM_PREAMBLE in system
+        assert fragments.taxonomy_block() in system
+        for instructions in (
+            fragments.CATEGORIZE_INSTRUCTIONS,
+            fragments.ROUTE_INSTRUCTIONS,
+            fragments.ESCALATE_INSTRUCTIONS,
+            fragments.DRAFT_INSTRUCTIONS,
+        ):
+            assert instructions in system
+
+    def test_baseline_user_text_matches_pipeline_first_step(self):
+        # R8: the baseline sees exactly the thread text the pipeline sees.
+        thread = make_threads(1)[1]
+        assert baseline_user_text(thread) == build_user_text(thread)
+
+    def test_baseline_is_one_call_with_all_four_outputs(self):
+        thread = make_threads(1)[1]
+        client = FakeClient([ok(BASE)])
+        result = run_baseline(thread, model=MODEL, client=client)
+        assert isinstance(result, BaselineResult)
+        assert result.category in fragments.CATEGORY_LABELS
+        assert result.queue in fragments.QUEUE_LABELS
+        assert result.escalate is False
+        assert result.escalate_reason
+        assert result.draft
+        assert result.status == "never_sent"
+        assert len(client.messages.calls) == 1  # ONE call for all four outputs
+        call = client.messages.calls[0]
+        assert call["system"] == baseline_system()
+        assert call["output_format"] is BaselineResult
+
+    def test_degenerate_thread_short_circuits_without_llm(self):
+        thread = make_thread(["@brand"])
+        result = run_baseline(thread, model=MODEL, client=ExplodingClient())
+        assert result.category == fragments.GENERAL_INQUIRY
+        assert result.escalate is True
+        assert "insufficient content" in result.escalate_reason.lower()
+        assert result.draft
+
+    def test_persistent_bad_output_becomes_typed_failure(self):
+        thread = make_threads(1)[1]
+        bad = [validation_error_for(BaselineResult, "{not json") for _ in range(3)]
+        result = run_baseline(thread, model=MODEL, client=FakeClient(bad))
+        assert isinstance(result, OutputFailure)
+        assert result.step == "baseline"
+
+
+class TestRunnerCheckpointsAndResume:
+    def test_mid_run_failure_leaves_resumable_checkpoint(self, tmp_path):
+        # R32: thread 1 completes and checkpoints; thread 2 dies on a
+        # transport error; the resumed run finishes WITHOUT re-calling
+        # thread 1.
+        threads = make_threads(3)
+        args = run_args(tmp_path)
+        failing = FakeClient(
+            list(PER_THREAD_OUTCOMES) + [RuntimeError("simulated transport failure")]
+        )
+        with pytest.raises(RuntimeError, match="transport"):
+            run_eval(threads, client=failing, **args)
+        assert completed_thread_ids(args["out_dir"]) == {1}
+
+        resumed_client = FakeClient(list(PER_THREAD_OUTCOMES) * 2)
+        summary = run_eval(threads, client=resumed_client, **args)
+        assert summary == {"completed": 3, "total": 3}
+        assert completed_thread_ids(args["out_dir"]) == {1, 2, 3}
+        # Only threads 2 and 3 were executed on resume (R32).
+        assert len(resumed_client.messages.calls) == 2 * CALLS_PER_THREAD
+
+    def test_output_failure_is_recorded_not_raised(self, tmp_path):
+        threads = make_threads(1)
+        args = run_args(tmp_path)
+        bad = [validation_error_for(CATEGORIZED.__class__, "{oops") for _ in range(3)]
+        client = FakeClient(bad + [ok(ROUTED), ok(ESCALATED), ok(DRAFTED), ok(BASE)])
+        summary = run_eval(threads, client=client, **args)
+        assert summary == {"completed": 1, "total": 1}
+        entry = json.loads(
+            checkpoint_path(args["out_dir"], 1).read_text(encoding="utf-8")
+        )
+        assert entry["ok"] is False
+        assert entry["pipeline"]["failed_steps"] == ["categorize"]
+        assert entry["baseline"]["category"]  # baseline arm still recorded
+
+    def test_write_results_refuses_incomplete_run(self, tmp_path):
+        threads = make_threads(3)
+        args = run_args(tmp_path)
+        failing = FakeClient(list(PER_THREAD_OUTCOMES) + [RuntimeError("boom")])
+        with pytest.raises(RuntimeError):
+            run_eval(threads, client=failing, **args)
+        # R32: metrics input (the results file) only from 100%-complete runs.
+        with pytest.raises(EvalError, match="resume"):
+            write_results(
+                args["out_dir"],
+                list(threads),
+                labels_path=write_labels(
+                    tmp_path / "gold.csv",
+                    [f"{i},Technical/Product,Technical/Product,false" for i in threads],
+                ),
+                profile="dev",
+                pipeline_model=MODEL,
+                baseline_model=MODEL,
+            )
+        assert not (args["out_dir"] / "results.json").exists()
+
+    def test_full_mocked_eval_over_ten_threads(self, tmp_path):
+        # Integration: a complete per-thread results file for BOTH arms.
+        threads = make_threads(10)
+        args = run_args(tmp_path)
+        summary = run_eval(threads, client=happy_client(10), **args)
+        assert summary == {"completed": 10, "total": 10}
+        labels_path = write_labels(
+            tmp_path / "gold.csv",
+            [f"{i},Technical/Product,Technical/Product,false" for i in threads],
+        )
+        results_path = write_results(
+            args["out_dir"],
+            list(threads),
+            labels_path=labels_path,
+            profile="dev",
+            pipeline_model=MODEL,
+            baseline_model=MODEL,
+            run_id="",
+        )
+        results = json.loads(results_path.read_text(encoding="utf-8"))
+        # KTD5: every results file records the determinism controls.
+        assert results["models"] == {"pipeline": MODEL, "baseline": MODEL}
+        assert set(results["prompt_hashes"]) == {
+            "categorize", "route", "escalate", "draft", "baseline",
+        }
+        assert results["eval_set_hash"]
+        assert results["complete"] is True
+        assert len(results["threads"]) == 10
+        for entry in results["threads"]:
+            assert entry["pipeline"]["steps"]["draft"]["status"] == "never_sent"
+            assert entry["baseline"]["status"] == "never_sent"
+            assert entry["ok"] is True
+
+
+@pytest.fixture
+def sample_db(tmp_path):
+    db_path = tmp_path / "sample.db"
+    ingest_csv(FIXTURE_CSV, db_path)
+    return db_path
+
+
+@pytest.fixture
+def eval_setup(sample_db, tmp_path):
+    """A store, a two-thread gold-labels file, and eval out/cache paths."""
+    conn = open_store(sample_db)
+    try:
+        ids = [
+            search_threads(conn, "data plan")[0]["thread_id"],
+            search_threads(conn, "package never arrived")[0]["thread_id"],
+        ]
+    finally:
+        conn.close()
+    labels = write_labels(
+        tmp_path / "gold.csv",
+        [f"{i},Technical/Product,Technical/Product,false" for i in ids],
+    )
+    return {
+        "db": sample_db,
+        "labels": labels,
+        "out": tmp_path / "eval-out",
+        "cache": tmp_path / "cache.db",
+        "thread_ids": ids,
+    }
+
+
+def eval_argv(setup, *extra):
+    return [
+        "eval",
+        "--labels", str(setup["labels"]),
+        "--db", str(setup["db"]),
+        "--out", str(setup["out"]),
+        "--cache", str(setup["cache"]),
+        *extra,
+    ]
+
+
+def run_cli(argv, capsys, client=None):
+    code = cli.main(argv, client=client)
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+class TestEvalCli:
+    def test_dry_run_prints_plan_and_executes_nothing(self, eval_setup, capsys):
+        # R32: planned call count + rough cost, then exit 0 with zero calls.
+        code, out, _ = run_cli(
+            eval_argv(eval_setup, "--dry-run"), capsys, client=ExplodingClient()
+        )
+        assert code == 0
+        assert f"= {2 * CALLS_PER_THREAD} calls" in out
+        assert "$" in out
+        assert MODEL in out  # --profile defaults to dev (R30)
+        assert not eval_setup["out"].exists()  # nothing executed
+
+    def test_preview_prints_before_execution(self, eval_setup, capsys):
+        code, out, _ = run_cli(
+            eval_argv(eval_setup), capsys, client=happy_client(2)
+        )
+        assert code == 0
+        assert out.index("Planned calls") < out.index("Results:")
+        results = json.loads(
+            (eval_setup["out"] / "results.json").read_text(encoding="utf-8")
+        )
+        assert len(results["threads"]) == 2
+        assert results["complete"] is True
+
+    def test_missing_labels_is_an_instructive_input_error(self, capsys):
+        code, _, err = run_cli(["eval", "--dry-run"], capsys, client=ExplodingClient())
+        assert code == 2
+        assert "--labels" in err
+
+    def test_labeled_thread_missing_from_store_is_an_input_error(
+        self, eval_setup, tmp_path, capsys
+    ):
+        labels = write_labels(
+            tmp_path / "bad-gold.csv",
+            ["9999,Technical/Product,Technical/Product,false"],
+        )
+        setup = {**eval_setup, "labels": labels}
+        code, _, err = run_cli(eval_argv(setup), capsys, client=ExplodingClient())
+        assert code == 2
+        assert "9999" in err
+
+    def test_interrupted_run_exits_nonzero_with_resume_instruction(
+        self, eval_setup, capsys
+    ):
+        # R32 error path: partial run -> nonzero + resume instruction, never a
+        # results file; the resumed run completes without re-calling thread 1.
+        failing = FakeClient(
+            list(PER_THREAD_OUTCOMES) + [RuntimeError("simulated transport failure")]
+        )
+        code, _, err = run_cli(eval_argv(eval_setup), capsys, client=failing)
+        assert code == 1
+        assert "resume" in err.lower()
+        assert "1/2 threads checkpointed" in err
+        assert not (eval_setup["out"] / "results.json").exists()
+
+        resumed = FakeClient(list(PER_THREAD_OUTCOMES))
+        code, _out, _ = run_cli(eval_argv(eval_setup), capsys, client=resumed)
+        assert code == 0
+        assert len(resumed.messages.calls) == CALLS_PER_THREAD  # thread 1 skipped
+        assert (eval_setup["out"] / "results.json").exists()
+
+    def test_run_id_salt_is_accepted_and_recorded(self, eval_setup, capsys):
+        code, _out, _ = run_cli(
+            eval_argv(eval_setup, "--run-id", "variance-1"),
+            capsys,
+            client=happy_client(2),
+        )
+        assert code == 0
+        results = json.loads(
+            (eval_setup["out"] / "results.json").read_text(encoding="utf-8")
+        )
+        assert results["run_id"] == "variance-1"

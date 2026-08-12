@@ -1,9 +1,14 @@
-"""Headless CLI (R7): ``triage ingest`` plus the ``triage run`` surface.
+"""Headless CLI (R7): ``triage ingest``, ``triage run``, and ``triage eval``.
 
 ``triage run`` processes one thread (or a batch) end-to-end through the
 LangGraph pipeline and emits the structured triage result as JSON, with
 distinct exit codes: 0 success, 1 pipeline failure, 2 input error. Batch runs
 continue past per-thread failures and exit nonzero if any failed (R7).
+
+``triage eval`` runs both eval arms (4-step pipeline and single-prompt
+baseline, R8) over the gold-labeled set: cache-first (KTD5), checkpointed and
+resumable (R32); it prints its planned call count and rough cost BEFORE
+executing, and ``--dry-run`` executes nothing.
 
 Threads come from the SQLite store by tweet id (any tweet id in a thread
 resolves to that thread, R31) or from an ``--input`` JSON file built into a
@@ -26,6 +31,8 @@ from triage.ingest.download import DATASET_HANDLE, DEFAULT_CSV_PATH
 _SAMPLE_CSV_RELATIVE = Path("tests") / "fixtures" / "sample_tweets.csv"
 DEFAULT_DB_PATH = Path("data") / "triage.db"
 DEFAULT_SAMPLE_DB_PATH = Path("data") / "sample.db"
+DEFAULT_EVAL_OUT_DIR = Path("results") / "eval"
+DEFAULT_CACHE_PATH = Path("data") / "llm_cache.db"
 
 # Exit codes (R7).
 EXIT_OK = 0
@@ -125,6 +132,61 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=f"path to the SQLite store (default: {DEFAULT_DB_PATH})",
+    )
+
+    evaluate = subparsers.add_parser(
+        "eval",
+        help="Run both eval arms over the gold-labeled set; cache-first, resumable.",
+        description=(
+            "Cache-first (KTD5), checkpointed, resumable (R32) execution of both eval "
+            "arms — the 4-step pipeline and the single-prompt baseline (R8) — over the "
+            "gold-labeled eval set. Prints the planned call count and rough cost BEFORE "
+            "executing. Exit codes: 0 complete, 1 partial/interrupted (with a resume "
+            "instruction), 2 input error."
+        ),
+    )
+    evaluate.add_argument(
+        "--labels",
+        type=Path,
+        default=None,
+        help="gold-labels CSV (columns: thread_id,category,queue,escalate; from U6)",
+    )
+    evaluate.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help=f"path to the SQLite store (default: {DEFAULT_DB_PATH})",
+    )
+    evaluate.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help=(
+            "checkpoint/results directory "
+            f"(default: {DEFAULT_EVAL_OUT_DIR}, or {DEFAULT_EVAL_OUT_DIR}-<run-id>)"
+        ),
+    )
+    evaluate.add_argument(
+        "--cache",
+        type=Path,
+        default=DEFAULT_CACHE_PATH,
+        help=f"SQLite LLM call cache shared across runs (KTD5; default: {DEFAULT_CACHE_PATH})",
+    )
+    evaluate.add_argument(
+        "--profile",
+        choices=["dev", "measurement"],
+        default="dev",
+        help="model profile (R30); default dev — measurement only for final recorded runs",
+    )
+    evaluate.add_argument(
+        "--run-id",
+        default="",
+        help="salt for variance passes: bypasses prior cache entries (KTD5)",
+    )
+    evaluate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the planned call count and rough cost, then execute nothing",
     )
     return parser
 
@@ -348,6 +410,115 @@ def _cmd_run(args: argparse.Namespace, client: Any = None) -> int:
     return EXIT_OK if result["ok"] else EXIT_PIPELINE_FAILURE
 
 
+def _load_eval_threads(args: argparse.Namespace, thread_ids) -> dict[int, Any]:
+    """Resolve every gold-labeled thread id against the store (input errors, R7)."""
+    from triage.ingest import IngestError
+    from triage.ingest.store import get_thread
+
+    conn = _open_existing_store(args.db or DEFAULT_DB_PATH)
+    try:
+        threads = {}
+        for thread_id in thread_ids:
+            try:
+                threads[thread_id] = get_thread(conn, thread_id)
+            except IngestError:
+                raise InputError(
+                    f"gold-labeled thread {thread_id} is not in the store "
+                    f"({args.db or DEFAULT_DB_PATH}); labels and store must describe "
+                    "the same eval set"
+                ) from None
+        return threads
+    finally:
+        conn.close()
+
+
+def _cmd_eval(args: argparse.Namespace, client: Any = None) -> int:
+    """Cache-first, checkpointed, resumable eval over both arms (R8, R32, KTD5)."""
+    from triage.config import ROLE_BASELINE, ROLE_PIPELINE, get_model
+    from triage.evals.runner import (
+        EvalError,
+        completed_thread_ids,
+        format_preview,
+        load_gold_labels,
+        resume_instruction,
+        run_eval,
+        write_results,
+    )
+
+    if args.labels is None:
+        print(
+            "error: --labels is required: point it at the gold-labels CSV "
+            "(columns: thread_id,category,queue,escalate; produced by the U6 "
+            "labeling pass)",
+            file=sys.stderr,
+        )
+        return EXIT_INPUT_ERROR
+    pipeline_model = get_model(ROLE_PIPELINE, args.profile)
+    baseline_model = get_model(ROLE_BASELINE, args.profile)
+    out_dir = args.out
+    if out_dir is None:
+        suffix = f"-{args.run_id}" if args.run_id else ""
+        out_dir = DEFAULT_EVAL_OUT_DIR.with_name(DEFAULT_EVAL_OUT_DIR.name + suffix)
+    try:
+        labels = load_gold_labels(args.labels)
+        threads = _load_eval_threads(args, list(labels))
+    except (EvalError, InputError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_ERROR
+
+    # R32: the planned call count and rough cost print BEFORE any execution.
+    done = completed_thread_ids(out_dir) & set(threads)
+    print(
+        format_preview(
+            len(threads) - len(done),
+            len(threads),
+            pipeline_model=pipeline_model,
+            baseline_model=baseline_model,
+            profile=args.profile,
+            run_id=args.run_id,
+        )
+    )
+    if args.dry_run:
+        print("Dry run: nothing executed.")
+        return EXIT_OK
+
+    try:
+        run_eval(
+            threads,
+            out_dir=out_dir,
+            cache_path=args.cache,
+            pipeline_model=pipeline_model,
+            baseline_model=baseline_model,
+            run_id=args.run_id,
+            client=client,
+        )
+    # Deliberately broad: ANY mid-run failure must yield the resume
+    # instruction rather than a bare stack trace (R32).
+    except Exception as exc:  # noqa: BLE001
+        done_now = len(completed_thread_ids(out_dir) & set(threads))
+        print(f"error: eval run interrupted: {exc}", file=sys.stderr)
+        print(
+            f"{done_now}/{len(threads)} threads checkpointed — {resume_instruction(out_dir)}",
+            file=sys.stderr,
+        )
+        return EXIT_PIPELINE_FAILURE
+    try:
+        results_path = write_results(
+            out_dir,
+            list(threads),
+            labels_path=args.labels,
+            profile=args.profile,
+            pipeline_model=pipeline_model,
+            baseline_model=baseline_model,
+            run_id=args.run_id,
+        )
+    except EvalError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_PIPELINE_FAILURE
+    print(f"Results: {results_path}")
+    return EXIT_OK
+
+
 def main(argv: list[str] | None = None, *, client: Any = None) -> int:
     """CLI entrypoint; ``client`` is injectable so tests never touch the network."""
     parser = _build_parser()
@@ -356,6 +527,8 @@ def main(argv: list[str] | None = None, *, client: Any = None) -> int:
         return _cmd_ingest(args)
     if args.command == "run":
         return _cmd_run(args, client=client)
+    if args.command == "eval":
+        return _cmd_eval(args, client=client)
     parser.print_help()
     return 0
 
