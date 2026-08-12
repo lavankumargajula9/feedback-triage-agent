@@ -24,6 +24,7 @@ dev = [
 
 [project.scripts]
 triage = "triage.cli:main"
+triage-mcp = "triage.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
