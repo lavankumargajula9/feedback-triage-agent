@@ -16,8 +16,9 @@ dist/
 .ruff_cache/
 .mypy_cache/
 
-# Data (raw downloads are not committed)
+# Data (raw downloads and generated SQLite stores are not committed)
 data/raw/
+data/*.db
 
 # Env / secrets
 .env
