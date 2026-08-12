@@ -15,9 +15,9 @@ labels:
   own reported line.
 - Confusion matrix for categorization; paired bootstrap confidence intervals
   (seeded, ~1000 resamples over per-thread prediction pairs) on the
-  pipeline-vs-baseline accuracy delta; variance-flip candidates; per-thread
-  token/cost/latency aggregation when checkpoints carry a ``usage`` block
-  (KTD6).
+  pipeline-vs-baseline accuracy delta; variance-flip candidates; per-arm
+  token/cost/latency aggregation over the ``usage`` block the runner records
+  per thread (KTD6).
 
 Draft quality is deliberately NOT here: the judge score is a distinct number
 reported alongside, never blended into, these metrics (R13).
@@ -193,8 +193,10 @@ def variance_flip_candidates(
 def aggregate_usage(entries: list[Mapping[str, Any]], system: str) -> dict[str, Any] | None:
     """Sum/mean the per-thread ``usage`` numbers for one arm, when present.
 
-    Checkpoints may carry ``entry["usage"][system]`` dicts of numeric fields
-    (tokens/cost/latency, KTD6); returns None when no thread has any.
+    The runner records ``entry["usage"][system]`` dicts of numeric fields
+    (calls/tokens/cost/latency, KTD6) with zeros for cache-served calls, so
+    totals describe money actually spent; returns None for runs that predate
+    usage capture, where no thread has a block.
     """
     rows = [
         entry["usage"][system]

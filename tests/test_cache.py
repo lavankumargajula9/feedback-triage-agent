@@ -10,13 +10,16 @@ Covers:
 - Simple serial backoff on transient (429/5xx) API errors — no concurrency
   machinery.
 - Key construction: every component (model, params, system, user text, schema
-  name, run id) participates in the key.
+  name, schema shape, run id) participates in the key.
+- Schema identity: a schema-only edit under the same class name is a MISS, and
+  a stored payload that no longer validates is a miss too — never a scored
+  model failure.
 
 Every test is fully mocked: zero network, no anthropic client constructed.
 """
 
 import pytest
-from pydantic import ValidationError
+from pydantic import ValidationError, create_model
 from test_tools import (
     CATEGORIZED,
     DIAGNOSABLE,
@@ -47,6 +50,18 @@ def cache(tmp_path):
     call_cache = CallCache(tmp_path / "cache.db")
     yield call_cache
     call_cache.close()
+
+
+def schema_variant(**fields):
+    """Two output schemas with the SAME module and qualname but different fields
+    — exactly what a schema-only edit (new field, tightened Literal) produces."""
+    return create_model("CategorizeResult", __module__="triage.tools.schemas", **fields)
+
+
+def poison_stored_payloads(cache, payload):
+    """Leave every stored payload no longer decodable by its schema."""
+    cache._conn.execute("UPDATE calls SET payload = ?", (payload,))
+    cache._conn.commit()
 
 
 class TestCacheHit:
@@ -144,6 +159,42 @@ class TestBackoff:
         assert len(inner.messages.calls) == 1
 
 
+class TestSchemaIdentity:
+    def test_schema_edit_under_the_same_name_is_a_miss(self, cache):
+        # A schema-only edit must not replay a payload the new schema rejects:
+        # that payload would fail validation inside parse() and be scored as a
+        # model failure instead of costing one honest call.
+        old = schema_variant(label=(str, ...))
+        new = schema_variant(label=(str, ...), severity=(str, ...))
+        inner = FakeClient(
+            [
+                ok(old(label="Technical/Product")),
+                ok(new(label="Technical/Product", severity="high")),
+            ]
+        )
+        client = CachingClient(cache, inner=inner)
+        client.messages.parse(**{**REQUEST, "output_format": old})
+        message = client.messages.parse(**{**REQUEST, "output_format": new})
+        assert len(inner.messages.calls) == 2
+        assert message.parsed_output.severity == "high"
+        assert client.hits == 0
+
+    def test_stale_payload_is_a_miss_not_an_output_failure(self, cache):
+        # An entry already poisoned before the key change: decoding it raises a
+        # ValidationError, which the LLM wrapper would otherwise count as bad
+        # model output and retry three times against the same stale entry.
+        inner = FakeClient([ok(CATEGORIZED), ok(CATEGORIZED)])
+        client = CachingClient(cache, inner=inner)
+        categorize(DIAGNOSABLE, model=MODEL, client=client)
+        poison_stored_payloads(cache, "{}")
+        result = categorize(DIAGNOSABLE, model=MODEL, client=client)
+        assert isinstance(result, CategorizeResult)
+        assert len(inner.messages.calls) == 2
+        # The stale entry is replaced, so the next call replays for free again.
+        assert categorize(DIAGNOSABLE, model=MODEL, client=client) == result
+        assert len(inner.messages.calls) == 2
+
+
 class TestCacheKey:
     def test_every_component_participates_in_the_key(self):
         base = {
@@ -151,6 +202,7 @@ class TestCacheKey:
             "system": "s",
             "user_text": "u",
             "schema_name": "CategorizeResult",
+            "schema_digest": "d1",
             "params": {"max_tokens": 1024},
             "run_id": "",
         }
@@ -159,6 +211,7 @@ class TestCacheKey:
             {**base, "system": "s2"},
             {**base, "user_text": "u2"},
             {**base, "schema_name": "RouteResult"},
+            {**base, "schema_digest": "d2"},
             {**base, "params": {"max_tokens": 2048}},
             {**base, "run_id": "variance-1"},
         ]

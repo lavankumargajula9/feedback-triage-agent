@@ -536,6 +536,7 @@ def _cmd_eval(args: argparse.Namespace, client: Any = None) -> int:
             pipeline_model=pipeline_model,
             baseline_model=baseline_model,
             run_id=args.run_id,
+            threads=threads,
         )
     except EvalError as exc:
         print(f"error: {exc}", file=sys.stderr)

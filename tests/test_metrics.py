@@ -36,7 +36,11 @@ Pipeline: accuracy 5/6; P/R: true 1/1, 1/2; false 4/5, 4/4 -> macro P 9/10,
 Route step: both arms predict every gold queue exactly -> all metrics 1.0.
 """
 
+import json
+
 import pytest
+from test_runner import MODEL, USAGE_PER_THREAD, make_threads, run_args, write_labels
+from test_tools import FakeClient
 
 from triage.evals.metrics import (
     OUTPUT_FAILURE,
@@ -46,7 +50,7 @@ from triage.evals.metrics import (
     compute_report,
     paired_bootstrap_delta,
 )
-from triage.evals.runner import EvalError, GoldLabel
+from triage.evals.runner import EvalError, GoldLabel, load_gold_labels, run_eval, write_results
 
 T = "Technical/Product"
 B = "Billing/Payments"
@@ -316,6 +320,42 @@ class TestFlipsAndUsage:
             "totals": {"cost": 0.5},
             "means": {"cost": 0.5},
         }
+
+
+class TestUsageOverRealCheckpoints:
+    def test_totals_come_from_checkpoints_the_runner_wrote(self, tmp_path):
+        # The cost/latency table must be reachable from a real run, not only
+        # from hand-built usage blocks: two threads x (4 pipeline + 1 baseline)
+        # calls, all token counts hand-summed from USAGE_PER_THREAD.
+        threads = make_threads(2)
+        args = run_args(tmp_path)
+        run_eval(threads, client=FakeClient(list(USAGE_PER_THREAD) * 2), **args)
+        labels_path = write_labels(
+            tmp_path / "gold.csv",
+            [f"{tid},Technical/Product,Technical/Product,false" for tid in threads],
+        )
+        results_path = write_results(
+            args["out_dir"],
+            list(threads),
+            labels_path=labels_path,
+            profile="dev",
+            pipeline_model=MODEL,
+            baseline_model=MODEL,
+            threads=threads,
+        )
+        results = json.loads(results_path.read_text(encoding="utf-8"))
+        report = compute_report(results, load_gold_labels(labels_path))
+        pipeline = report["usage"]["pipeline"]
+        assert pipeline["threads"] == 2
+        assert pipeline["totals"]["calls"] == 8
+        assert pipeline["totals"]["tokens_in"] == 920
+        assert pipeline["totals"]["tokens_out"] == 92
+        assert pipeline["means"]["tokens_in"] == 460
+        assert pipeline["totals"]["cost"] == pytest.approx(2 * (460 + 46 * 5) / 1_000_000)
+        baseline = report["usage"]["baseline"]
+        assert baseline["totals"]["calls"] == 2
+        assert baseline["totals"]["tokens_in"] == 400
+        assert baseline["totals"]["cost"] == pytest.approx(2 * (200 + 40 * 5) / 1_000_000)
 
 
 class TestInputValidation:

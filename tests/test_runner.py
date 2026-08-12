@@ -11,6 +11,11 @@ Covers:
   resumable run, resume never re-calls completed threads, results files are
   written only for 100%-complete runs and record model ids + prompt hashes +
   eval-set hash.
+- Thread-content integrity (R32): a checkpoint whose thread text has since
+  changed is refused on resume and by write_results, so no results file mixes
+  two generations of thread text.
+- Per-arm usage capture (KTD6): tokens/cost/latency land in every checkpoint,
+  with zeros for calls served from the cache.
 - CLI `triage eval`: cost preview printed BEFORE executing, --dry-run executes
   nothing, incomplete run exits nonzero with a resume instruction.
 
@@ -18,6 +23,7 @@ Every test is fully mocked and in-process: zero network, no real client.
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from test_tools import (
@@ -45,6 +51,8 @@ from triage.evals.runner import (
     load_gold_labels,
     run_baseline,
     run_eval,
+    thread_fingerprint,
+    threads_digest,
     write_results,
 )
 from triage.ingest.store import ingest_csv, open_store
@@ -67,6 +75,28 @@ BASE = BaselineResult(
 PER_THREAD_OUTCOMES = [ok(CATEGORIZED), ok(ROUTED), ok(ESCALATED), ok(DRAFTED), ok(BASE)]
 
 LABEL_HEADER = "thread_id,category,queue,escalate\n"
+
+
+def ok_with_usage(parsed, tokens_in, tokens_out):
+    """A scripted response carrying token usage, like the real message object."""
+    return SimpleNamespace(
+        parsed_output=parsed,
+        stop_reason="end_turn",
+        usage=SimpleNamespace(input_tokens=tokens_in, output_tokens=tokens_out),
+    )
+
+
+# One thread's worth of usage-bearing outcomes, in runner call order.
+USAGE_PER_THREAD = [
+    ok_with_usage(CATEGORIZED, 100, 10),
+    ok_with_usage(ROUTED, 110, 11),
+    ok_with_usage(ESCALATED, 120, 12),
+    ok_with_usage(DRAFTED, 130, 13),
+    ok_with_usage(BASE, 200, 40),
+]
+# claude-haiku-4-5 at $1/MTok in, $5/MTok out, hand-computed from the tokens above.
+PIPELINE_COST = (460 * 1.0 + 46 * 5.0) / 1_000_000
+BASELINE_COST = (200 * 1.0 + 40 * 5.0) / 1_000_000
 
 
 def make_threads(count):
@@ -364,6 +394,118 @@ class TestRunnerCheckpointsAndResume:
             assert entry["pipeline"]["steps"]["draft"]["status"] == "never_sent"
             assert entry["baseline"]["status"] == "never_sent"
             assert entry["ok"] is True
+
+
+class TestThreadContentIntegrity:
+    def test_resume_refuses_when_thread_content_changed(self, tmp_path):
+        # Ingest gains a previously-missing tweet, then an interrupted run is
+        # resumed: mixing two generations of thread text would stamp
+        # `complete: true` on outputs the loaded threads do not describe.
+        threads = make_threads(2)
+        args = run_args(tmp_path)
+        failing = FakeClient(
+            list(PER_THREAD_OUTCOMES) + [RuntimeError("simulated transport failure")]
+        )
+        with pytest.raises(RuntimeError, match="transport"):
+            run_eval(threads, client=failing, **args)
+        assert completed_thread_ids(args["out_dir"]) == {1}
+
+        drifted = {
+            **threads,
+            1: make_thread(
+                [
+                    "@brand hi, following up on my earlier complaint",
+                    "@brand my order number 1001 arrived broken and shows error code 1",
+                ]
+            ),
+        }
+        with pytest.raises(EvalError, match="thread 1"):
+            run_eval(drifted, client=happy_client(2), **args)
+
+    def test_write_results_refuses_content_drifted_checkpoints(self, tmp_path):
+        threads = make_threads(1)
+        args = run_args(tmp_path)
+        run_eval(threads, client=happy_client(1), **args)
+        labels_path = write_labels(
+            tmp_path / "gold.csv", ["1,Technical/Product,Technical/Product,false"]
+        )
+        drifted = {1: make_thread(["@brand a completely different problem, error 42 now"])}
+        with pytest.raises(EvalError, match="thread 1"):
+            write_results(
+                args["out_dir"],
+                list(threads),
+                labels_path=labels_path,
+                profile="measurement",
+                pipeline_model=MODEL,
+                baseline_model=MODEL,
+                threads=drifted,
+            )
+        assert not (args["out_dir"] / "results.json").exists()
+
+    def test_results_file_surfaces_thread_fingerprints(self, tmp_path):
+        threads = make_threads(2)
+        args = run_args(tmp_path)
+        run_eval(threads, client=happy_client(2), **args)
+        labels_path = write_labels(
+            tmp_path / "gold.csv",
+            [f"{i},Technical/Product,Technical/Product,false" for i in threads],
+        )
+        results_path = write_results(
+            args["out_dir"],
+            list(threads),
+            labels_path=labels_path,
+            profile="dev",
+            pipeline_model=MODEL,
+            baseline_model=MODEL,
+            threads=threads,
+        )
+        results = json.loads(results_path.read_text(encoding="utf-8"))
+        assert results["thread_digest"] == threads_digest(
+            {tid: thread_fingerprint(thread) for tid, thread in threads.items()}
+        )
+        for entry in results["threads"]:
+            assert entry["thread_fingerprint"] == thread_fingerprint(
+                threads[entry["thread_id"]]
+            )
+
+
+class TestUsageCapture:
+    def test_usage_is_recorded_per_arm(self, tmp_path):
+        threads = make_threads(1)
+        args = run_args(tmp_path)
+        run_eval(threads, client=FakeClient(list(USAGE_PER_THREAD)), **args)
+        usage = json.loads(
+            checkpoint_path(args["out_dir"], 1).read_text(encoding="utf-8")
+        )["usage"]
+        assert usage["pipeline"]["calls"] == 4
+        assert usage["baseline"]["calls"] == 1
+        assert usage["pipeline"]["tokens_in"] == 460
+        assert usage["pipeline"]["tokens_out"] == 46
+        assert usage["baseline"]["tokens_in"] == 200
+        assert usage["baseline"]["tokens_out"] == 40
+        assert usage["pipeline"]["cost"] == pytest.approx(PIPELINE_COST)
+        assert usage["baseline"]["cost"] == pytest.approx(BASELINE_COST)
+        assert usage["pipeline"]["cached_calls"] == 0
+        # Wall-clock timings: relationships only, never a measured duration.
+        assert usage["pipeline"]["latency_s"] >= 0.0
+        assert usage["baseline"]["latency_s"] >= 0.0
+
+    def test_cache_hits_record_zero_cost(self, tmp_path):
+        # A replayed call spends nothing, so the totals must not bill for it.
+        threads = make_threads(1)
+        args = run_args(tmp_path)
+        run_eval(threads, client=FakeClient(list(USAGE_PER_THREAD)), **args)
+        replay_args = {**args, "out_dir": tmp_path / "replay"}
+        run_eval(threads, client=ExplodingClient(), **replay_args)
+        usage = json.loads(
+            checkpoint_path(replay_args["out_dir"], 1).read_text(encoding="utf-8")
+        )["usage"]
+        assert usage["pipeline"]["cached_calls"] == 4
+        assert usage["baseline"]["cached_calls"] == 1
+        for arm in ("pipeline", "baseline"):
+            assert usage[arm]["cost"] == 0
+            assert usage[arm]["tokens_in"] == 0
+            assert usage[arm]["tokens_out"] == 0
 
 
 @pytest.fixture

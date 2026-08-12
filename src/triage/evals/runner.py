@@ -12,7 +12,10 @@ Three responsibilities:
   thread through the shared call cache, checkpointing each per-thread result
   to disk as it completes. Resume skips completed threads; the results file —
   the only input metrics may use — is written exclusively for 100%-complete
-  runs and records model ids, prompt hashes, and the eval-set hash.
+  runs and records model ids, prompt hashes, the eval-set hash, and a digest of
+  the rendered thread text. Every checkpoint is pinned to the models, prompts,
+  and thread text that produced it, and carries what each arm spent on it, so
+  neither a model swap nor an ingest change can be mixed into one results file.
 
 Execution is serial (backoff on transient errors lives in the cache wrapper);
 typed OutputFailures are recorded in checkpoints, never raised (R27).
@@ -24,19 +27,19 @@ import csv
 import hashlib
 import json
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from triage.evals.cache import CachingClient, CallCache
+from triage.evals.cache import CachingClient, CallCache, call_cost, usage_delta
 from triage.ingest.reconstruct import Thread
 from triage.pipeline import result_dict, run_pipeline
 from triage.prompts import fragments
 from triage.tools.llm import call_with_schema
-from triage.tools.retrieval import build_user_text, degenerate_reason
+from triage.tools.retrieval import build_user_text, degenerate_reason, render_thread
 from triage.tools.schemas import NEVER_SENT, CategoryLabel, OutputFailure, QueueLabel
 
 
@@ -215,20 +218,11 @@ CALLS_PER_THREAD = PIPELINE_CALLS_PER_THREAD + BASELINE_CALLS_PER_THREAD
 # Rough per-call token budget from the plan; cost preview only, never billing.
 TOKENS_IN_PER_CALL = 1500
 TOKENS_OUT_PER_CALL = 300
-# (input $/MTok, output $/MTok) per model id used by draft roles.
-PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
-    "claude-opus-5": (5.0, 25.0),
-    "claude-haiku-4-5": (1.0, 5.0),
-}
 
 
 def cost_per_call(model: str) -> float | None:
     """Rough dollars per call, or None when the model has no price on file."""
-    prices = PRICES_PER_MTOK.get(model)
-    if prices is None:
-        return None
-    in_price, out_price = prices
-    return (TOKENS_IN_PER_CALL * in_price + TOKENS_OUT_PER_CALL * out_price) / 1_000_000
+    return call_cost(model, TOKENS_IN_PER_CALL, TOKENS_OUT_PER_CALL)
 
 
 def format_preview(
@@ -309,6 +303,22 @@ def completed_thread_ids(out_dir: Path | str) -> set[int]:
     return {int(p.stem) for p in directory.glob("*.json") if p.stem.isdigit()}
 
 
+def thread_fingerprint(thread: Thread) -> str:
+    """SHA-256 of the thread text actually fed to the model (R32).
+
+    ``render_thread`` is the single rendering every surface uses, so this
+    fingerprint moves whenever ingest changes what the model would see.
+    """
+    return _sha256_text(render_thread(thread))
+
+
+def threads_digest(fingerprints: Mapping[int, str]) -> str:
+    """One digest over every thread's fingerprint, recorded in the results file."""
+    return _sha256_text(
+        "\n".join(f"{tid}:{fingerprints[tid]}" for tid in sorted(fingerprints))
+    )
+
+
 def run_identity(
     *, pipeline_model: str, baseline_model: str, run_id: str = ""
 ) -> dict[str, Any]:
@@ -337,10 +347,28 @@ def _identity_mismatch(expected: dict[str, Any], found: Any) -> str | None:
     return None
 
 
+def _fingerprint_mismatch(entry: dict[str, Any], expected: str) -> str | None:
+    """Why a checkpoint's thread text differs from the loaded thread's, or None."""
+    found = entry.get("thread_fingerprint")
+    if found is None:
+        return "checkpoint predates thread fingerprinting"
+    if found != expected:
+        return "the rendered thread text has changed since it ran"
+    return None
+
+
 def _check_checkpoint_identity(
-    out_dir: Path, thread_ids: Iterable[int], expected: dict[str, Any]
+    out_dir: Path,
+    thread_ids: Iterable[int],
+    expected: dict[str, Any],
+    fingerprints: Mapping[int, str] | None = None,
 ) -> None:
-    """Raise EvalError if any existing checkpoint came from a different run."""
+    """Raise EvalError if any existing checkpoint came from a different run.
+
+    ``fingerprints`` additionally pins each checkpoint to the thread text now
+    loaded: the run-level identity covers models and prompts, not what ingest
+    fed the model (R32).
+    """
     for thread_id in thread_ids:
         path = checkpoint_path(out_dir, thread_id)
         if not path.is_file():
@@ -356,6 +384,17 @@ def _check_checkpoint_identity(
                 "mixing runs would report results the recorded model ids do not "
                 "describe. Use a fresh --out directory for this configuration, or "
                 "delete that directory to re-run it from scratch."
+            )
+        if fingerprints is None or thread_id not in fingerprints:
+            continue
+        reason = _fingerprint_mismatch(entry, fingerprints[thread_id])
+        if reason is not None:
+            raise EvalError(
+                f"checkpoint {path} was produced from different content for "
+                f"thread {thread_id} ({reason}); mixing thread-text generations "
+                "would report results the loaded eval threads do not describe. "
+                "Use a fresh --out directory for this configuration, or delete "
+                "that directory to re-run it from scratch."
             )
 
 
@@ -396,10 +435,11 @@ def run_eval(
     Threads already checkpointed are skipped; each completed thread is written
     to disk before the next begins, so an interruption at any point leaves a
     resumable run. Both arms call through the shared SQLite cache (KTD5), so a
-    re-run of an interrupted thread replays its completed calls for free. Typed
-    OutputFailures are recorded in checkpoints, never raised (R27); only
-    transport-level exceptions propagate (the CLI turns them into a resume
-    instruction).
+    re-run of an interrupted thread replays its completed calls for free. Each
+    checkpoint carries its thread's text fingerprint and the tokens/cost/latency
+    each arm spent on it (KTD6). Typed OutputFailures are recorded in
+    checkpoints, never raised (R27); only transport-level exceptions propagate
+    (the CLI turns them into a resume instruction).
     """
     out_dir = Path(out_dir)
     checkpoint_dir(out_dir).mkdir(parents=True, exist_ok=True)
@@ -407,8 +447,9 @@ def run_eval(
     identity = run_identity(
         pipeline_model=pipeline_model, baseline_model=baseline_model, run_id=run_id
     )
+    fingerprints = {tid: thread_fingerprint(thread) for tid, thread in threads.items()}
     # Refuse before spending anything if this out_dir holds another run's work.
-    _check_checkpoint_identity(out_dir, sorted(done), identity)
+    _check_checkpoint_identity(out_dir, sorted(done), identity, fingerprints)
     cache = CallCache(cache_path)
     try:
         caching_client = CachingClient(cache, inner=client, run_id=run_id)
@@ -416,9 +457,11 @@ def run_eval(
             if thread_id in done:
                 continue
             thread = threads[thread_id]
+            before = caching_client.usage_snapshot()
             pipeline_result = result_dict(
                 run_pipeline(thread, model=pipeline_model, client=caching_client)
             )
+            after_pipeline = caching_client.usage_snapshot()
             baseline = _baseline_payload(
                 run_baseline(thread, model=baseline_model, client=caching_client)
             )
@@ -426,8 +469,13 @@ def run_eval(
                 "thread_id": thread_id,
                 "run_id": run_id,
                 "identity": identity,
+                "thread_fingerprint": fingerprints[thread_id],
                 "pipeline": pipeline_result,
                 "baseline": baseline,
+                "usage": {
+                    "pipeline": usage_delta(before, after_pipeline),
+                    "baseline": usage_delta(after_pipeline, caching_client.usage_snapshot()),
+                },
                 "ok": pipeline_result["ok"] and "failure" not in baseline,
             }
             _write_json_atomic(checkpoint_path(out_dir, thread_id), entry)
@@ -475,11 +523,14 @@ def write_results(
     pipeline_model: str,
     baseline_model: str,
     run_id: str = "",
+    threads: Mapping[int, Thread] | None = None,
 ) -> Path:
     """Assemble the run's results file from checkpoints — 100%-complete only (R32).
 
     A partial run raises EvalError carrying the resume instruction; metrics and
     regression comparisons are computed only from files this function wrote.
+    ``threads`` is the loaded eval set: when supplied, every checkpoint must
+    also match its thread's current text fingerprint.
     """
     out_dir = Path(out_dir)
     thread_ids = sorted(thread_ids)
@@ -493,13 +544,20 @@ def write_results(
             f"(missing thread ids: {shown}{suffix}); metrics are computed only from "
             f"100%-complete runs (R32) — {resume_instruction(out_dir)}"
         )
-    # Defense in depth (R32): never stamp models onto outputs they did not produce.
+    fingerprints = (
+        None
+        if threads is None
+        else {tid: thread_fingerprint(thread) for tid, thread in threads.items()}
+    )
+    # Defense in depth (R32): never stamp models or thread text onto outputs
+    # they did not produce.
     _check_checkpoint_identity(
         out_dir,
         thread_ids,
         run_identity(
             pipeline_model=pipeline_model, baseline_model=baseline_model, run_id=run_id
         ),
+        fingerprints,
     )
     entries = [
         json.loads(checkpoint_path(out_dir, tid).read_text(encoding="utf-8"))
@@ -511,6 +569,9 @@ def write_results(
         "models": {"pipeline": pipeline_model, "baseline": baseline_model},
         "prompt_hashes": prompt_hashes(),
         "eval_set_hash": eval_set_hash(labels_path),
+        "thread_digest": threads_digest(
+            {entry["thread_id"]: entry.get("thread_fingerprint", "") for entry in entries}
+        ),
         "determinism": (
             "pinned model ids + frozen prompt hashes above + run-id salt for "
             "variance passes (KTD5); the chosen models accept no sampling parameters"
