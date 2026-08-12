@@ -7,11 +7,14 @@ Covers:
   and threads queryable by tweet id.
 - Distribution-mode metadata defaulting to "pending" (R2 verdict not fabricated)
   and both eval-set export modes (R29).
+- The gold-label guard: a re-ingest may not silently move or rewrite a frozen
+  label's thread (R11).
 - `triage ingest --sample` via cli.main, zero network.
 
 No test touches the network or kagglehub.
 """
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -35,6 +38,37 @@ from triage.ingest.store import (
 )
 
 FIXTURE_CSV = Path(__file__).parent / "fixtures" / "sample_tweets.csv"
+
+CSV_HEADER = (
+    "tweet_id,author_id,inbound,created_at,text,response_tweet_id,in_response_to_tweet_id\n"
+)
+
+
+def _write_csv(path: Path, rows) -> Path:
+    """Write a minimal dataset CSV; rows are (tweet_id, author_id, inbound, parent_id).
+
+    ``created_at`` is derived from the tweet id so chronological order matches id
+    order (ids must stay below 60).
+    """
+    lines = [CSV_HEADER]
+    for tweet_id, author_id, inbound, parent in rows:
+        lines.append(
+            f"{tweet_id},{author_id},{inbound},"
+            f"Wed Nov 01 12:{tweet_id:02d}:00 +0000 2017,msg {tweet_id},,"
+            f"{'' if parent is None else parent}\n"
+        )
+    path.write_text("".join(lines), encoding="utf-8")
+    return path
+
+
+def _membership_snapshot(db_path) -> dict[int, tuple[int, ...]]:
+    """Every stored thread's ordered tweet ids, keyed by thread id."""
+    conn = open_store(db_path)
+    try:
+        thread_ids = [row["thread_id"] for row in conn.execute("SELECT thread_id FROM threads")]
+        return {tid: get_thread(conn, tid).tweet_ids for tid in thread_ids}
+    finally:
+        conn.close()
 
 
 @pytest.fixture
@@ -128,6 +162,138 @@ class TestReIngest:
             conn.close()
 
 
+class TestGoldLabelGuard:
+    """A re-ingest must never silently move or rewrite a gold-labeled thread (R11).
+
+    Two hazards, both invisible after the fact: a labeled thread's membership can
+    change under a stable ``thread_id``, and a labeled thread can be superseded
+    when a previously-missing parent tweet arrives and re-roots the conversation
+    under a new ``thread_id``. Either one leaves published metrics describing
+    content nobody labeled.
+    """
+
+    LINEAR = ((1, "C", True, None), (2, "brand", False, 1), (3, "C", True, 2))
+    # Root tweet 1 is absent, so tweet 2 reconstructs as a truncated root (R31).
+    TRUNCATED = ((2, "C", True, 1), (3, "brand", False, 2))
+    EXTENDED = (*LINEAR, (4, "brand", False, 3))
+
+    def _labeled_store(self, tmp_path, rows=LINEAR):
+        csv_path = _write_csv(tmp_path / "a.csv", rows)
+        db_path = tmp_path / "store.db"
+        ingest_csv(csv_path, db_path)
+        conn = open_store(db_path)
+        try:
+            (thread_id,) = thread_ids_for_tweet(conn, rows[-1][0])
+            add_eval_item(conn, thread_id, "billing")
+        finally:
+            conn.close()
+        return db_path, thread_id
+
+    def test_unchanged_re_ingest_of_a_labeled_store_is_silent(self, tmp_path):
+        db_path, _ = self._labeled_store(tmp_path)
+        before = _membership_snapshot(db_path)
+        stats = ingest_csv(tmp_path / "a.csv", db_path)
+        assert stats["labeled_thread_hazards"] == []
+        assert _membership_snapshot(db_path) == before
+
+    def test_unlabeled_store_absorbs_a_membership_change_silently(self, tmp_path):
+        db_path = tmp_path / "store.db"
+        ingest_csv(_write_csv(tmp_path / "a.csv", self.LINEAR), db_path)
+        stats = ingest_csv(_write_csv(tmp_path / "b.csv", self.EXTENDED), db_path)
+        assert stats["labeled_thread_hazards"] == []
+        assert sorted(_membership_snapshot(db_path).values()) == [(1, 2, 3, 4)]
+
+    def test_membership_change_under_a_labeled_thread_is_refused(self, tmp_path):
+        db_path, thread_id = self._labeled_store(tmp_path)
+        with pytest.raises(IngestError) as excinfo:
+            ingest_csv(_write_csv(tmp_path / "b.csv", self.EXTENDED), db_path)
+        message = str(excinfo.value)
+        assert f"thread {thread_id}" in message
+        assert "membership" in message
+        assert "1,2,3,4" in message  # the operator can see what it became
+
+    def test_refused_ingest_leaves_the_store_untouched(self, tmp_path):
+        db_path, _ = self._labeled_store(tmp_path)
+        before = _membership_snapshot(db_path)
+        with pytest.raises(IngestError):
+            ingest_csv(_write_csv(tmp_path / "b.csv", self.EXTENDED), db_path)
+        assert _membership_snapshot(db_path) == before
+        conn = open_store(db_path)
+        try:
+            assert conn.execute("SELECT 1 FROM tweets WHERE tweet_id = 4").fetchone() is None
+        finally:
+            conn.close()
+
+    def test_supersession_by_a_late_parent_is_refused_naming_the_thread(self, tmp_path):
+        db_path, thread_id = self._labeled_store(tmp_path, self.TRUNCATED)
+        with pytest.raises(IngestError) as excinfo:
+            ingest_csv(
+                _write_csv(tmp_path / "b.csv", ((1, "C", True, None), *self.TRUNCATED)),
+                db_path,
+            )
+        message = str(excinfo.value)
+        assert f"thread {thread_id}" in message
+        assert "superseded" in message
+        assert "root 1" in message  # where the conversation moved
+
+    def test_labeled_thread_untouched_by_the_new_csv_is_silent(self, tmp_path):
+        db_path, _ = self._labeled_store(tmp_path)
+        before = _membership_snapshot(db_path)
+        other = _write_csv(tmp_path / "c.csv", ((11, "D", True, None), (12, "brand", False, 11)))
+        stats = ingest_csv(other, db_path)
+        assert stats["labeled_thread_hazards"] == []
+        assert before.items() <= _membership_snapshot(db_path).items()
+
+    def test_explicit_acceptance_completes_and_names_the_change(self, tmp_path):
+        db_path, thread_id = self._labeled_store(tmp_path)
+        stats = ingest_csv(
+            _write_csv(tmp_path / "b.csv", self.EXTENDED),
+            db_path,
+            accept_labeled_thread_changes=True,
+        )
+        (hazard,) = stats["labeled_thread_hazards"]
+        assert hazard["thread_id"] == thread_id
+        assert hazard["hazard"] == "membership_changed"
+        assert _membership_snapshot(db_path)[thread_id] == (1, 2, 3, 4)
+
+    def test_membership_is_persisted_per_thread(self, tmp_path):
+        db_path, thread_id = self._labeled_store(tmp_path)
+        conn = open_store(db_path)
+        try:
+            row = conn.execute(
+                "SELECT membership FROM threads WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row["membership"] == "1,2,3"
+
+    def test_store_predating_the_membership_column_is_migrated_and_backfilled(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        legacy = sqlite3.connect(db_path)
+        try:
+            legacy.executescript(
+                "CREATE TABLE threads (thread_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "root_tweet_id INTEGER NOT NULL, customer_author_id TEXT, "
+                "truncated INTEGER NOT NULL, cycle_flagged INTEGER NOT NULL);"
+                "CREATE TABLE thread_tweets (thread_id INTEGER NOT NULL, "
+                "position INTEGER NOT NULL, tweet_id INTEGER NOT NULL, "
+                "PRIMARY KEY (thread_id, position));"
+                "INSERT INTO threads VALUES (7, 1, 'C', 0, 0);"
+                "INSERT INTO thread_tweets VALUES (7, 0, 1), (7, 1, 2), (7, 2, 3);"
+            )
+            legacy.commit()
+        finally:
+            legacy.close()
+        conn = open_store(db_path)
+        try:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(threads)")}
+            row = conn.execute("SELECT membership FROM threads WHERE thread_id = 7").fetchone()
+        finally:
+            conn.close()
+        assert "membership" in columns
+        assert row["membership"] == "1,2,3"
+
+
 class TestIngestEndToEnd:
     def test_stats(self, store_conn):
         _, stats = store_conn
@@ -136,6 +302,7 @@ class TestIngestEndToEnd:
             "threads": 6,
             "truncated": 1,
             "cycle_flagged": 1,
+            "labeled_thread_hazards": [],
         }
 
     def test_mid_thread_tweet_resolves_to_same_thread_as_root(self, store_conn):
