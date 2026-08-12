@@ -99,13 +99,15 @@ GET_THREAD_DESCRIPTION = (
 )
 
 CATEGORIZE_DESCRIPTION = (
-    "Categorize a stored thread: returns exactly one category label plus a rationale "
-    f"grounded in the thread text. {_LLM_NOTE}\n\n{fragments.taxonomy_block()}"
+    "Categorize a stored thread: returns exactly one category label (what the issue is "
+    f"about) plus a rationale grounded in the thread text. {_LLM_NOTE}"
+    f"\n\n{fragments.category_block()}"
 )
 
 ROUTE_DESCRIPTION = (
-    "Route a stored thread: returns exactly one support-queue label (the team best "
-    f"placed to resolve it) plus a rationale. {_LLM_NOTE}\n\n{fragments.taxonomy_block()}"
+    "Route a stored thread: returns exactly one support-queue label (which team should "
+    "own it) plus a rationale. The queue label set is a different vocabulary from the "
+    f"category label set. {_LLM_NOTE}\n\n{fragments.queue_block()}"
 )
 
 DRAFT_DESCRIPTION = (

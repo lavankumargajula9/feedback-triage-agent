@@ -34,7 +34,9 @@ def categorize(
     return call_with_schema(
         STEP_NAME,
         model=model,
-        system=fragments.step_system(fragments.CATEGORIZE_INSTRUCTIONS),
+        system=fragments.step_system(
+            fragments.CATEGORIZE_INSTRUCTIONS, fragments.category_block()
+        ),
         user_text=build_user_text(thread),
         schema=CategorizeResult,
         client=client,

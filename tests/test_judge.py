@@ -80,7 +80,9 @@ def jr(c, t, g, a, send=True):
 
 def make_gold(spec):
     return {
-        tid: GoldLabel(thread_id=tid, category=cat, queue=cat, escalate=esc)
+        tid: GoldLabel(
+            thread_id=tid, category=cat, queue="Technical Support", escalate=esc
+        )
         for tid, (cat, esc) in spec.items()
     }
 
@@ -98,7 +100,7 @@ def make_entry(tid, pipeline_draft, baseline_draft):
     else:
         baseline = {
             "category": "Technical/Product",
-            "queue": "Technical/Product",
+            "queue": "Technical Support",
             "escalate": False,
             "escalate_reason": "r",
             "draft": baseline_draft,
@@ -109,7 +111,7 @@ def make_entry(tid, pipeline_draft, baseline_draft):
         "pipeline": {
             "steps": {
                 "categorize": {"label": "Technical/Product", "rationale": "r"},
-                "route": {"queue": "Technical/Product", "rationale": "r"},
+                "route": {"queue": "Technical Support", "rationale": "r"},
                 "escalate": {"escalate": False, "reason": "r"},
                 "draft": draft_step,
             },

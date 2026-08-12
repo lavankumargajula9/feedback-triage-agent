@@ -134,7 +134,7 @@ DIAGNOSABLE = make_thread(
 )
 
 CATEGORIZED = CategorizeResult(label="Technical/Product", rationale="Service outage reported.")
-ROUTED = RouteResult(queue="Technical/Product", rationale="Needs the technical team.")
+ROUTED = RouteResult(queue="Technical Support", rationale="Needs the technical team.")
 DRAFTED = DraftResult(draft="So sorry about that — can you share your account email?")
 ESCALATED = EscalateResult(escalate=False, reason="Routine technical issue, macro-resolvable.")
 
@@ -154,7 +154,7 @@ class TestHappyPath:
         assert call["model"] == MODEL
         # The thread text and the single-sourced taxonomy reach the model.
         assert "data plan stopped working" in call["messages"][0]["content"]
-        assert fragments.taxonomy_block() in call["system"]
+        assert fragments.category_block() in call["system"]
         assert call["output_format"] is CategorizeResult
 
     def test_route_passes_prior_category_explicitly(self):
@@ -242,7 +242,7 @@ class TestDegenerateThreads:
         client = ExplodingClient()
         routed = route(thread, None, model=MODEL, client=client)
         drafted = draft(thread, None, None, model=MODEL, client=client)
-        assert routed.queue == "General Inquiry"
+        assert routed.queue == "Tier-1 General"
         assert "insufficient content" in routed.rationale.lower()
         assert isinstance(drafted, DraftResult)
         assert drafted.status == "never_sent"
@@ -268,11 +268,37 @@ class TestSingleSourcedTaxonomy:
         assert get_args(CategoryLabel) == fragments.CATEGORY_LABELS
         assert get_args(QueueLabel) == fragments.QUEUE_LABELS
 
-    def test_category_and_queue_share_one_working_set(self):
-        # R4: the indicative six-label set serves both, defined in one place.
-        assert fragments.QUEUE_LABELS is fragments.CATEGORY_LABELS
+    def test_category_and_queue_are_independent_label_sets(self):
+        # R4: sharing one vocabulary makes route a restatement of categorize.
+        assert fragments.QUEUE_LABELS is not fragments.CATEGORY_LABELS
+        assert set(fragments.QUEUE_LABELS).isdisjoint(fragments.CATEGORY_LABELS)
         assert len(fragments.CATEGORY_LABELS) == 6
-        assert "General Inquiry" in fragments.CATEGORY_LABELS
+        assert len(fragments.QUEUE_LABELS) == 6
+
+    def test_no_category_label_encodes_escalation(self):
+        # Escalation judgment belongs to the escalate field alone.
+        assert "Complaint/Dispute" in fragments.CATEGORY_LABELS
+        assert not any("Escalat" in label for label in fragments.CATEGORY_LABELS)
+
+    def test_no_queue_label_encodes_escalation(self):
+        assert not any("Escalat" in label for label in fragments.QUEUE_LABELS)
+
+    def test_degenerate_fallbacks_are_in_their_own_label_sets(self):
+        assert fragments.GENERAL_INQUIRY in fragments.CATEGORY_LABELS
+        assert fragments.DEGENERATE_QUEUE in fragments.QUEUE_LABELS
+
+    def test_each_step_sees_only_its_own_label_space(self):
+        route_system = fragments.step_system(
+            fragments.ROUTE_INSTRUCTIONS, fragments.queue_block()
+        )
+        assert "Tier-1 General" in route_system
+        assert "Billing/Payments" not in route_system
+
+        categorize_system = fragments.step_system(
+            fragments.CATEGORIZE_INSTRUCTIONS, fragments.category_block()
+        )
+        assert "Billing/Payments" in categorize_system
+        assert "Tier-1 General" not in categorize_system
 
     def test_draft_status_cannot_be_anything_but_never_sent(self):
         with pytest.raises(ValidationError):

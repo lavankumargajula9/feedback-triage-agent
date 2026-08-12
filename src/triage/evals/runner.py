@@ -166,7 +166,8 @@ def baseline_system() -> str:
     four step instructions, in step order."""
     return (
         f"{fragments.SYSTEM_PREAMBLE}\n\n"
-        f"{fragments.taxonomy_block()}\n\n"
+        f"{fragments.category_block()}\n\n"
+        f"{fragments.queue_block()}\n\n"
         f"{BASELINE_TASK_HEADER}\n\n"
         f"{fragments.CATEGORIZE_INSTRUCTIONS}\n\n"
         f"{fragments.ROUTE_INSTRUCTIONS}\n\n"
@@ -192,7 +193,7 @@ def run_baseline(
     if reason is not None:
         return BaselineResult(
             category=fragments.GENERAL_INQUIRY,
-            queue=fragments.GENERAL_INQUIRY,
+            queue=fragments.DEGENERATE_QUEUE,
             escalate=True,
             escalate_reason=fragments.insufficient_content_reason(reason),
             draft=fragments.DEGENERATE_DRAFT,
@@ -558,8 +559,14 @@ def prompt_hashes() -> dict[str, str]:
     control is pinned model ids + these hashes + measured variance.
     """
     return {
-        "categorize": sha256_text(fragments.step_system(fragments.CATEGORIZE_INSTRUCTIONS)),
-        "route": sha256_text(fragments.step_system(fragments.ROUTE_INSTRUCTIONS)),
+        "categorize": sha256_text(
+            fragments.step_system(
+                fragments.CATEGORIZE_INSTRUCTIONS, fragments.category_block()
+            )
+        ),
+        "route": sha256_text(
+            fragments.step_system(fragments.ROUTE_INSTRUCTIONS, fragments.queue_block())
+        ),
         "escalate": sha256_text(fragments.step_system(fragments.ESCALATE_INSTRUCTIONS)),
         "draft": sha256_text(fragments.step_system(fragments.DRAFT_INSTRUCTIONS)),
         "baseline": sha256_text(baseline_system()),

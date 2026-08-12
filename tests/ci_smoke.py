@@ -27,7 +27,7 @@ from triage.tools.schemas import (
 
 SCRIPTED = [
     CategorizeResult(label="Technical/Product", rationale="Service outage reported."),
-    RouteResult(queue="Technical/Product", rationale="Needs the technical team."),
+    RouteResult(queue="Technical Support", rationale="Needs the technical team."),
     EscalateResult(escalate=False, reason="Routine issue, resolvable by the queue."),
     DraftResult(draft="Sorry about that — can you share your account email?"),
 ]
@@ -74,7 +74,7 @@ def main() -> int:
         steps = result["steps"]
         checks = {
             "categorize label": steps["categorize"]["label"] == "Technical/Product",
-            "route queue": steps["route"]["queue"] == "Technical/Product",
+            "route queue": steps["route"]["queue"] == "Technical Support",
             "escalation reason": bool(steps["escalate"]["reason"]),
             "draft never sent": steps["draft"]["status"] == "never_sent",
             "draft text": bool(steps["draft"]["draft"]),

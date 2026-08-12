@@ -73,7 +73,7 @@ class TestHappyPath:
         steps = result["steps"]
         assert steps["categorize"]["label"] == "Technical/Product"
         assert steps["categorize"]["rationale"]
-        assert steps["route"]["queue"] == "Technical/Product"
+        assert steps["route"]["queue"] == "Technical Support"
         assert steps["route"]["rationale"]
         assert steps["escalate"]["escalate"] is False
         assert steps["escalate"]["reason"]
@@ -131,7 +131,7 @@ class TestDegenerateThreads:
         thread = make_thread(["@brand help"])
         state = run_pipeline(thread, model=MODEL, client=ExplodingClient())
         assert state["category"].label == "General Inquiry"
-        assert state["queue"].queue == "General Inquiry"
+        assert state["queue"].queue == "Tier-1 General"
         assert state["escalation"].escalate is True
         assert "insufficient content" in state["escalation"].reason.lower()
         assert state["draft"].status == "never_sent"

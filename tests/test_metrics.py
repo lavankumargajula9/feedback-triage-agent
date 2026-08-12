@@ -332,7 +332,7 @@ class TestUsageOverRealCheckpoints:
         run_eval(threads, client=FakeClient(list(USAGE_PER_THREAD) * 2), **args)
         labels_path = write_labels(
             tmp_path / "gold.csv",
-            [f"{tid},Technical/Product,Technical/Product,false" for tid in threads],
+            [f"{tid},Technical/Product,Technical Support,false" for tid in threads],
         )
         results_path = write_results(
             args["out_dir"],

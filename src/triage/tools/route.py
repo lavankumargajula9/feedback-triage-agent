@@ -33,13 +33,13 @@ def route(
     reason = degenerate_reason(thread)
     if reason is not None:
         return RouteResult(
-            queue=fragments.GENERAL_INQUIRY,
+            queue=fragments.DEGENERATE_QUEUE,
             rationale=fragments.insufficient_content_reason(reason),
         )
     return call_with_schema(
         STEP_NAME,
         model=model,
-        system=fragments.step_system(fragments.ROUTE_INSTRUCTIONS),
+        system=fragments.step_system(fragments.ROUTE_INSTRUCTIONS, fragments.queue_block()),
         user_text=build_user_text(thread, category),
         schema=RouteResult,
         client=client,

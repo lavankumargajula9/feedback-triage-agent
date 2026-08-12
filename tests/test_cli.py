@@ -75,7 +75,7 @@ class TestRunSingle:
         result = json.loads(out)
         steps = result["steps"]
         assert steps["categorize"]["label"] == "Technical/Product"
-        assert steps["route"]["queue"] == "Technical/Product"
+        assert steps["route"]["queue"] == "Technical Support"
         assert steps["escalate"]["escalate"] is False
         assert steps["escalate"]["reason"]
         assert steps["draft"]["status"] == "never_sent"

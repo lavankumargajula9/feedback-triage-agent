@@ -2,10 +2,11 @@
 
 Everything a prompt is built from is defined here exactly once:
 
-- The predefined, generic, cross-industry taxonomy (R4). The same indicative
-  six-label working set serves BOTH the category and the queue label sets; the
-  sets are finalized in a later unit (U6) with changes logged, and any change
-  happens here only.
+- The two predefined, generic, cross-industry label sets (R4), finalized in U6
+  and changed here only. They are deliberately disjoint vocabularies on
+  different axes: CATEGORY names what the issue is about, QUEUE names which
+  team owns it. Sharing one set (as the indicative planning set did) made route
+  a restatement of categorize rather than a distinct decision.
 - Per-step instructions for categorize / route / draft / escalate.
 - Assembly helpers (system prompt, thread block, prior-outputs block) used by
   the pipeline steps now and by the single-prompt baseline later, so both
@@ -18,10 +19,10 @@ pure string functions.
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# Taxonomy (R4) — single source for category AND queue label sets.
+# Category taxonomy (R4) — what the customer's issue is about.
 # ---------------------------------------------------------------------------
 
-TAXONOMY: tuple[tuple[str, str], ...] = (
+CATEGORY_TAXONOMY: tuple[tuple[str, str], ...] = (
     (
         "Billing/Payments",
         "Charges, refunds, invoices, payment methods, pricing, or anything about money.",
@@ -45,10 +46,12 @@ TAXONOMY: tuple[tuple[str, str], ...] = (
         "Login problems, password resets, account settings, verification, or account data.",
     ),
     (
-        "Complaint/Escalation",
+        "Complaint/Dispute",
         (
-            "Expressions of serious dissatisfaction, repeated unresolved contact, threats "
-            "to leave, or demands for a manager/formal complaint."
+            "The grievance itself is the subject: general service dissatisfaction, a "
+            "threat to leave, or a formal complaint. Prefer the specific functional "
+            "label when the grievance is about a concrete billing, shipping, technical, "
+            "or access issue. Says nothing about urgency — that is decided separately."
         ),
     ),
     (
@@ -60,13 +63,49 @@ TAXONOMY: tuple[tuple[str, str], ...] = (
     ),
 )
 
-# The same six-label working set serves both steps (R4); U6 may split them, and
-# would do so by editing this module only.
-CATEGORY_LABELS: tuple[str, ...] = tuple(label for label, _ in TAXONOMY)
-QUEUE_LABELS: tuple[str, ...] = CATEGORY_LABELS
 
+# ---------------------------------------------------------------------------
+# Queue taxonomy (R4) — which team owns the thread. Ownership only: a queue
+# naming escalation would be near-deterministically escalate=true, duplicating
+# that decision into the label space.
+# ---------------------------------------------------------------------------
+
+QUEUE_TAXONOMY: tuple[tuple[str, str], ...] = (
+    (
+        "Tier-1 General",
+        "Front-line handling: self-serve answers, simple questions, deflection.",
+    ),
+    (
+        "Billing Ops",
+        "Finance-authorized actions: refunds, adjustments, invoice corrections.",
+    ),
+    (
+        "Technical Support",
+        "Diagnosis requiring product or engineering knowledge.",
+    ),
+    (
+        "Logistics",
+        "Carrier contact, shipment tracing, warehouse and returns handling.",
+    ),
+    (
+        "Account Security",
+        "Identity verification, lockouts, suspected account compromise.",
+    ),
+    (
+        "Trust & Safety",
+        "Fraud, abuse, threats, legal or reputational exposure.",
+    ),
+)
+
+CATEGORY_LABELS: tuple[str, ...] = tuple(label for label, _ in CATEGORY_TAXONOMY)
+QUEUE_LABELS: tuple[str, ...] = tuple(label for label, _ in QUEUE_TAXONOMY)
+
+# R28 fallbacks — each must stay inside its own step's label set.
 GENERAL_INQUIRY = "General Inquiry"
-assert GENERAL_INQUIRY in CATEGORY_LABELS  # R28 fallback must stay in-taxonomy
+DEGENERATE_QUEUE = "Tier-1 General"
+assert GENERAL_INQUIRY in CATEGORY_LABELS
+assert DEGENERATE_QUEUE in QUEUE_LABELS
+assert set(CATEGORY_LABELS).isdisjoint(QUEUE_LABELS)
 
 
 # ---------------------------------------------------------------------------
@@ -81,16 +120,30 @@ SYSTEM_PREAMBLE = (
 )
 
 
-def taxonomy_block() -> str:
-    """Render the label definitions shown to the model (and to the baseline)."""
-    lines = ["Label set (use one of these labels exactly as written; no other label exists):"]
-    lines.extend(f"- {label}: {definition}" for label, definition in TAXONOMY)
+def _label_block(heading: str, taxonomy: tuple[tuple[str, str], ...]) -> str:
+    lines = [f"{heading} (use one of these labels exactly as written; no other label exists):"]
+    lines.extend(f"- {label}: {definition}" for label, definition in taxonomy)
     return "\n".join(lines)
 
 
-def step_system(step_instructions: str) -> str:
-    """Assemble a step's system prompt from the shared pieces."""
-    return f"{SYSTEM_PREAMBLE}\n\n{taxonomy_block()}\n\n{step_instructions}"
+def category_block() -> str:
+    """Category label definitions — what the issue is about."""
+    return _label_block("Category label set", CATEGORY_TAXONOMY)
+
+
+def queue_block() -> str:
+    """Queue label definitions — which team owns the thread."""
+    return _label_block("Support queue label set", QUEUE_TAXONOMY)
+
+
+def step_system(step_instructions: str, *label_blocks: str) -> str:
+    """Assemble a step's system prompt from the shared pieces.
+
+    A step receives only the label space it must choose from; showing route the
+    category definitions re-anchors it on content.
+    """
+    parts = [SYSTEM_PREAMBLE, *label_blocks, step_instructions]
+    return "\n\n".join(parts)
 
 
 def thread_block(rendered_thread: str) -> str:
@@ -132,8 +185,13 @@ CATEGORIZE_INSTRUCTIONS = (
 
 ROUTE_INSTRUCTIONS = (
     "Task — route: assign exactly one support-queue label from the label set, naming "
-    "the team best placed to resolve this thread. Give a brief rationale grounded in "
-    "the thread text."
+    "the team that should own this thread. Decide by which team's authority and skills "
+    "the resolution actually needs — not by restating what the issue is about. A "
+    "billing question a front-line agent can answer belongs to Tier-1 General, not "
+    "Billing Ops; an account problem showing signs of compromise belongs to Account "
+    "Security; fraud, abuse, or legal exposure belongs to Trust & Safety whatever the "
+    "topic. Do not choose a queue on urgency alone — urgency is decided separately. "
+    "Give a brief rationale grounded in the thread text."
 )
 
 DRAFT_INSTRUCTIONS = (

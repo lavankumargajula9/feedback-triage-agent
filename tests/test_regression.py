@@ -291,8 +291,8 @@ def cli_setup(tmp_path):
     labels = write_labels(
         tmp_path / "gold.csv",
         [
-            f"{ids[0]},Technical/Product,Technical/Product,false",
-            f"{ids[1]},Billing/Payments,Billing/Payments,false",
+            f"{ids[0]},Technical/Product,Technical Support,false",
+            f"{ids[1]},Billing/Payments,Billing Ops,false",
         ],
     )
     anchors = tmp_path / "anchors.json"

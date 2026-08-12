@@ -66,7 +66,7 @@ MODEL = "claude-haiku-4-5"
 
 BASE = BaselineResult(
     category="Technical/Product",
-    queue="Technical/Product",
+    queue="Technical Support",
     escalate=False,
     escalate_reason="Routine technical issue.",
     draft="So sorry about that — we're on it!",
@@ -134,8 +134,8 @@ class TestGoldLabelsLoader:
         path = write_labels(
             tmp_path / "gold.csv",
             [
-                "1,Technical/Product,Technical/Product,true",
-                "2,Billing/Payments,Billing/Payments,false",
+                "1,Technical/Product,Technical Support,true",
+                "2,Billing/Payments,Billing Ops,false",
             ],
         )
         labels = load_gold_labels(path)
@@ -145,7 +145,7 @@ class TestGoldLabelsLoader:
 
     def test_off_taxonomy_category_is_rejected(self, tmp_path):
         path = write_labels(
-            tmp_path / "gold.csv", ["1,Weather,Technical/Product,false"]
+            tmp_path / "gold.csv", ["1,Weather,Technical Support,false"]
         )
         with pytest.raises(EvalError, match="Weather"):
             load_gold_labels(path)
@@ -161,8 +161,8 @@ class TestGoldLabelsLoader:
         path = write_labels(
             tmp_path / "gold.csv",
             [
-                "1,Technical/Product,Technical/Product,false",
-                "1,Billing/Payments,Billing/Payments,true",
+                "1,Technical/Product,Technical Support,false",
+                "1,Billing/Payments,Billing Ops,true",
             ],
         )
         with pytest.raises(EvalError, match="[Dd]uplicate"):
@@ -176,7 +176,7 @@ class TestGoldLabelsLoader:
 
     def test_bad_escalate_value_is_rejected(self, tmp_path):
         path = write_labels(
-            tmp_path / "gold.csv", ["1,Technical/Product,Technical/Product,maybe"]
+            tmp_path / "gold.csv", ["1,Technical/Product,Technical Support,maybe"]
         )
         with pytest.raises(EvalError, match="escalate"):
             load_gold_labels(path)
@@ -189,7 +189,7 @@ class TestGoldLabelsLoader:
         # Labeling tools on Windows (Excel, PowerShell) write a UTF-8 BOM.
         path = tmp_path / "gold.csv"
         path.write_text(
-            LABEL_HEADER + "1,Technical/Product,Technical/Product,false\n",
+            LABEL_HEADER + "1,Technical/Product,Technical Support,false\n",
             encoding="utf-8-sig",
         )
         assert set(load_gold_labels(path)) == {1}
@@ -197,11 +197,13 @@ class TestGoldLabelsLoader:
 
 class TestBaselineArm:
     def test_baseline_prompt_reuses_the_shared_fragments(self):
-        # R8: equal information — the same preamble, the same taxonomy text,
-        # and the same four step-instruction fragments the pipeline uses.
+        # R8: equal information — the same preamble, the same four step
+        # instructions, and BOTH label spaces, since the baseline emits a
+        # category and a queue in one call.
         system = baseline_system()
         assert fragments.SYSTEM_PREAMBLE in system
-        assert fragments.taxonomy_block() in system
+        assert fragments.category_block() in system
+        assert fragments.queue_block() in system
         for instructions in (
             fragments.CATEGORIZE_INSTRUCTIONS,
             fragments.ROUTE_INSTRUCTIONS,
@@ -209,6 +211,39 @@ class TestBaselineArm:
             fragments.DRAFT_INSTRUCTIONS,
         ):
             assert instructions in system
+
+
+class TestPromptHashIdentity:
+    """KTD5 drift detection is only honest if the hashed prompt is the prompt
+    the step actually sends; prompt_hashes() rebuilds them independently."""
+
+    def test_hashed_step_prompts_match_what_the_tools_send(self):
+        from triage.evals.runner import prompt_hashes, sha256_text
+        from triage.tools import categorize, draft, escalate, route
+
+        hashes = prompt_hashes()
+        thread = make_thread(["@brand my data plan stopped working with error 105"])
+
+        invocations = {
+            "categorize": (CATEGORIZED, lambda c: categorize(thread, model="m", client=c)),
+            "route": (ROUTED, lambda c: route(thread, CATEGORIZED, model="m", client=c)),
+            "escalate": (
+                ESCALATED,
+                lambda c: escalate(thread, CATEGORIZED, ROUTED, model="m", client=c),
+            ),
+            "draft": (
+                DRAFTED,
+                lambda c: draft(thread, CATEGORIZED, ROUTED, model="m", client=c),
+            ),
+        }
+
+        for step, (response, call) in invocations.items():
+            client = FakeClient([ok(response)])
+            call(client)
+            system = client.messages.calls[0]["system"]
+            assert hashes[step] == sha256_text(system), (
+                f"prompt_hashes()[{step!r}] does not hash the prompt the step sends"
+            )
 
     def test_baseline_user_text_matches_pipeline_first_step(self):
         # R8: the baseline sees exactly the thread text the pipeline sees.
@@ -318,7 +353,7 @@ class TestRunnerCheckpointsAndResume:
         args = run_args(tmp_path)
         run_eval(threads, client=happy_client(1), **args)
         labels_path = write_labels(
-            tmp_path / "gold.csv", ["1,Technical/Product,Technical/Product,false"]
+            tmp_path / "gold.csv", ["1,Technical/Product,Technical Support,false"]
         )
         with pytest.raises(EvalError, match="pipeline_model"):
             write_results(
@@ -356,7 +391,7 @@ class TestRunnerCheckpointsAndResume:
                 list(threads),
                 labels_path=write_labels(
                     tmp_path / "gold.csv",
-                    [f"{i},Technical/Product,Technical/Product,false" for i in threads],
+                    [f"{i},Technical/Product,Technical Support,false" for i in threads],
                 ),
                 profile="dev",
                 pipeline_model=MODEL,
@@ -372,7 +407,7 @@ class TestRunnerCheckpointsAndResume:
         assert summary == {"completed": 10, "total": 10}
         labels_path = write_labels(
             tmp_path / "gold.csv",
-            [f"{i},Technical/Product,Technical/Product,false" for i in threads],
+            [f"{i},Technical/Product,Technical Support,false" for i in threads],
         )
         results_path = write_results(
             args["out_dir"],
@@ -429,7 +464,7 @@ class TestThreadContentIntegrity:
         args = run_args(tmp_path)
         run_eval(threads, client=happy_client(1), **args)
         labels_path = write_labels(
-            tmp_path / "gold.csv", ["1,Technical/Product,Technical/Product,false"]
+            tmp_path / "gold.csv", ["1,Technical/Product,Technical Support,false"]
         )
         drifted = {1: make_thread(["@brand a completely different problem, error 42 now"])}
         with pytest.raises(EvalError, match="thread 1"):
@@ -450,7 +485,7 @@ class TestThreadContentIntegrity:
         run_eval(threads, client=happy_client(2), **args)
         labels_path = write_labels(
             tmp_path / "gold.csv",
-            [f"{i},Technical/Product,Technical/Product,false" for i in threads],
+            [f"{i},Technical/Product,Technical Support,false" for i in threads],
         )
         results_path = write_results(
             args["out_dir"],
@@ -556,7 +591,7 @@ def eval_setup(sample_db, tmp_path):
         conn.close()
     labels = write_labels(
         tmp_path / "gold.csv",
-        [f"{i},Technical/Product,Technical/Product,false" for i in ids],
+        [f"{i},Technical/Product,Technical Support,false" for i in ids],
     )
     return {
         "db": sample_db,
@@ -618,7 +653,7 @@ class TestEvalCli:
     ):
         labels = write_labels(
             tmp_path / "bad-gold.csv",
-            ["9999,Technical/Product,Technical/Product,false"],
+            ["9999,Technical/Product,Technical Support,false"],
         )
         setup = {**eval_setup, "labels": labels}
         code, _, err = run_cli(eval_argv(setup), capsys, client=ExplodingClient())
