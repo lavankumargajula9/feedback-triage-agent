@@ -37,6 +37,7 @@ _SAMPLE_CSV_RELATIVE = Path("tests") / "fixtures" / "sample_tweets.csv"
 DEFAULT_DB_PATH = Path("data") / "triage.db"
 DEFAULT_SAMPLE_DB_PATH = Path("data") / "sample.db"
 DEFAULT_EVAL_OUT_DIR = Path("results") / "eval"
+DEFAULT_LABEL_DIR = Path("data") / "eval"
 DEFAULT_CACHE_PATH = Path("data") / "llm_cache.db"
 
 # Exit codes (R7).
@@ -137,6 +138,53 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=f"path to the SQLite store (default: {DEFAULT_DB_PATH})",
+    )
+
+    label = subparsers.add_parser(
+        "label",
+        help="Hand-label the eval set one field at a time (U6), or merge the passes.",
+        description=(
+            "Three-pass labeling (R11, R24). Each pass collects exactly one field over "
+            "the whole set in its own seeded order, writing its own file; passes cannot "
+            "read each other, so a later field is never anchored on an earlier answer. "
+            "Run all three, then --merge to produce the gold-labels CSV."
+        ),
+    )
+    label.add_argument(
+        "--pass",
+        dest="pass_name",
+        choices=("category", "queue", "escalate"),
+        default=None,
+        help="which field this pass collects",
+    )
+    label.add_argument(
+        "--merge",
+        action="store_true",
+        help="combine the three completed passes into the gold-labels CSV",
+    )
+    label.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help=f"path to the SQLite store (default: {DEFAULT_DB_PATH})",
+    )
+    label.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help=f"directory holding the per-pass files (default: {DEFAULT_LABEL_DIR})",
+    )
+    label.add_argument(
+        "--labels",
+        type=Path,
+        default=None,
+        help="destination gold-labels CSV for --merge",
+    )
+    label.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="label at most this many threads (default: all)",
     )
 
     evaluate = subparsers.add_parser(
@@ -837,6 +885,96 @@ def _eval_judge_and_gate(
     return EXIT_OK
 
 
+def _cmd_label(args: argparse.Namespace) -> int:
+    """Run one labeling pass, or merge the three completed passes (U6)."""
+    from triage.evals import label_helper as lh
+
+    if not args.merge and args.pass_name is None:
+        print("error: pass --pass {category,queue,escalate} or --merge.", file=sys.stderr)
+        return EXIT_INPUT_ERROR
+
+    out_dir = args.out or DEFAULT_LABEL_DIR
+
+    if args.merge:
+        dest = args.labels or (Path(out_dir) / "gold_labels.csv")
+        try:
+            written = lh.merge_passes(out_dir, dest)
+        except lh.LabelHelperError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_INPUT_ERROR
+        print(f"merged {written} threads into {dest}")
+        return EXIT_OK
+
+    pass_ = {p.name: p for p in lh.PASSES}[args.pass_name]
+    try:
+        conn = _open_existing_store(args.db or DEFAULT_DB_PATH)
+    except InputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_ERROR
+
+    items, excluded = _label_candidates(conn, args.limit)
+    if not items:
+        print("error: no labelable threads in the store.", file=sys.stderr)
+        return EXIT_INPUT_ERROR
+    pending = lh.pending_items(pass_, out_dir, items)
+
+    if excluded:
+        print(f"excluded {excluded} thread(s) with no diagnosable content (R11)")
+    print(f"pass '{pass_.name}': {len(pending)} of {len(items)} threads remaining")
+    print(f"answers append to {lh.pass_path(pass_, out_dir)}")
+    print("enter the number of your choice, or 'q' to stop and resume later.\n")
+
+    options = list(pass_.options)
+    for position, item in enumerate(pending, start=1):
+        print("=" * 70)
+        print(f"[{position}/{len(pending)}] thread {item.thread_id}\n")
+        print(item.text)
+        print(f"\n{pass_.prompt}")
+        for index, option in enumerate(options, start=1):
+            print(f"  {index}. {option}")
+        choice = input("> ").strip()
+        if choice.lower() in {"q", "quit"}:
+            print("stopped; rerun the same command to resume.")
+            return EXIT_OK
+        try:
+            value = options[int(choice) - 1]
+        except (ValueError, IndexError):
+            print("unrecognized choice; stopping without recording it.", file=sys.stderr)
+            return EXIT_INPUT_ERROR
+        lh.record_answer(pass_, out_dir, item.thread_id, value)
+
+    print(f"\npass '{pass_.name}' complete.")
+    return EXIT_OK
+
+
+def _label_candidates(conn, limit: int | None):
+    """Labelable items keyed by store thread_id, plus the excluded count.
+
+    Degenerate threads are excluded from the eval set (R11); the count is
+    reported so the cleaning rule is disclosed rather than silent.
+    """
+    from triage.evals.label_helper import LabelItem
+    from triage.tools.retrieval import (
+        degenerate_reason,
+        get_thread_by_id,
+        list_threads,
+        render_thread,
+    )
+
+    total = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+    rows = list_threads(conn, limit=limit or total)
+    items, excluded = [], 0
+    for row in rows:
+        thread = get_thread_by_id(conn, row["thread_id"])
+        if degenerate_reason(thread) is not None:
+            excluded += 1
+            continue
+        items.append(
+            LabelItem(thread_id=row["thread_id"], text=render_thread(thread))
+        )
+    return tuple(items), excluded
+
+
 def main(argv: list[str] | None = None, *, client: Any = None) -> int:
     """CLI entrypoint; ``client`` is injectable so tests never touch the network."""
     parser = _build_parser()
@@ -847,6 +985,8 @@ def main(argv: list[str] | None = None, *, client: Any = None) -> int:
         return _cmd_run(args, client=client)
     if args.command == "eval":
         return _cmd_eval(args, client=client)
+    if args.command == "label":
+        return _cmd_label(args)
     parser.print_help()
     return 0
 

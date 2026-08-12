@@ -272,3 +272,54 @@ class TestIngestStillWorks:
         assert db_path.is_file()
         out = capsys.readouterr().out
         assert "Ingested" in out
+
+
+class TestLabelCommand:
+    def test_requires_a_pass_or_merge(self, capsys):
+        code, _out, err = run_cli(["label"], capsys)
+        assert code == 2
+        assert "--pass" in err
+
+    def test_merge_without_any_pass_files_exits_2(self, tmp_path, capsys):
+        code, _out, err = run_cli(
+            ["label", "--merge", "--out", str(tmp_path)], capsys
+        )
+        assert code == 2
+        assert "no answers recorded" in err
+
+    def test_merge_writes_the_gold_file(self, tmp_path, capsys):
+        from triage.evals.label_helper import (
+            CATEGORY_PASS,
+            ESCALATE_PASS,
+            QUEUE_PASS,
+            record_answer,
+        )
+
+        for thread_id in (1, 2):
+            record_answer(CATEGORY_PASS, tmp_path, thread_id, "Billing/Payments")
+            record_answer(QUEUE_PASS, tmp_path, thread_id, "Billing Ops")
+            record_answer(ESCALATE_PASS, tmp_path, thread_id, "false")
+
+        dest = tmp_path / "gold_labels.csv"
+        code, out, _err = run_cli(
+            ["label", "--merge", "--out", str(tmp_path), "--labels", str(dest)], capsys
+        )
+        assert code == 0
+        assert "merged 2 threads" in out
+        assert dest.is_file()
+
+    def test_missing_store_exits_2(self, tmp_path, capsys):
+        code, _out, err = run_cli(
+            [
+                "label",
+                "--pass",
+                "category",
+                "--db",
+                str(tmp_path / "nope.db"),
+                "--out",
+                str(tmp_path),
+            ],
+            capsys,
+        )
+        assert code == 2
+        assert "no store" in err
