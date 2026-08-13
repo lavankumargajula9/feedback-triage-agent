@@ -1,0 +1,209 @@
+# Customer Feedback Triage Agent
+
+A four-step LangGraph triage pipeline over real customer-support threads, exposed
+through an MCP server and measured against a hand-labeled eval set with a
+single-prompt baseline.
+
+## Why this repo exists
+
+My production agentic work is LangGraph orchestration with real operational
+metrics, and none of it is inspectable — it is client and employer code. A
+resume claim nobody can check reads the same as one that is untrue. This project
+is the inspectable counterpart: the same orchestration claim, on public data,
+plus the two things that production work does not demonstrate at all —
+protocol-level tool exposure (MCP) and formal quantified evaluation of an LLM
+system.
+
+The triage domain is a real problem in its own right. Raw multi-brand support
+traffic is messy: fragmented threads, vague complaints, mixed intents. Deciding
+*what is this about*, *who should own it*, and *does a human need to see it now*
+is exactly the work a single prompt handles poorly and a measured multi-step
+system can be shown to handle better — if you actually measure it.
+
+## Status
+
+**In progress. No measured comparison exists yet, and this README will not carry
+one until it does.**
+
+| Component | State |
+|---|---|
+| Ingestion + thread reconstruction | Working — 2,811,774 tweets → 901,648 threads, 108 brands |
+| Tool layer (categorize / route / draft / escalate) | Working — schema-enforced, typed failures |
+| LangGraph pipeline + CLI | Working |
+| MCP server | Working — structural parity tests against the same tool functions |
+| Eval harness (cache, runner, metrics, judge, regression) | Built and tested, nothing measured through it yet |
+| Candidate pool for the eval set | Building |
+| Gold labels | Not started — blocked on the pool |
+| Measured baseline-vs-pipeline results | **Not produced** |
+| Terminal recording (R19) | Not recorded |
+
+The eval harness is complete *before* any results exist, which is deliberate:
+the agreement protocol, tolerances, and metric set are frozen in code so they
+cannot be tuned after seeing a number.
+
+## Architecture
+
+```
+Kaggle twcs CSV
+      |
+      v
+  ingest  ->  SQLite store (threads, reconstruction flags)
+                  |
+                  +--> triage run ----> LangGraph pipeline ----> JSON result
+                  |                     categorize -> route
+                  |                     -> draft -> escalate
+                  |
+                  +--> triage-mcp ----> same tool functions over MCP
+                  |
+                  +--> triage pool --> frozen candidate pool
+                            |               |
+                            |         triage label (3 isolated passes)
+                            |               |
+                            |         gold_labels.csv
+                            |               |
+                            +--------> triage eval
+                                      pipeline arm vs single-prompt baseline
+                                      at equal information
+```
+
+The pipeline and the baseline assemble their prompts from the same fragments
+module, so "4-step pipeline vs single prompt" is a comparison at equal
+information by construction rather than by assertion.
+
+The eval-set construction path is deliberately **separate** from the runtime
+pipeline and runs on a different model profile. Conflating them is the specific
+error that would invalidate the measurement.
+
+## Quickstart
+
+Requires Python 3.12+ and an Anthropic API key.
+
+```bash
+python -m venv .venv
+.venv/Scripts/activate          # POSIX: source .venv/bin/activate
+pip install -e ".[dev]"
+export ANTHROPIC_API_KEY=sk-...  # Windows: set ANTHROPIC_API_KEY=sk-...
+
+pytest                           # full suite, no network — every LLM call is mocked
+```
+
+Get the data (see *Data and licensing* below for why it is not committed):
+
+```bash
+triage ingest                    # downloads via kagglehub, reconstructs threads
+triage ingest --sample           # or: build a fixture store, no Kaggle account needed
+```
+
+Run one thread end to end:
+
+```bash
+triage run <tweet_id> --profile dev
+```
+
+Any tweet id belonging to a thread resolves to the whole reconstructed thread.
+`--profile dev` uses the cheap development model; measurement models are reserved
+for recorded runs only.
+
+### Commands
+
+| Command | Purpose |
+|---|---|
+| `triage ingest` | Kaggle CSV → reconstructed threads in SQLite |
+| `triage run` | One thread or a batch → structured JSON result |
+| `triage pool` | Build and freeze the stratified candidate pool |
+| `triage label` | Hand-label the eval set, one field per pass |
+| `triage eval` | Run both arms over the gold set; cache-first, resumable |
+| `triage-mcp` | Serve the tool layer over MCP |
+
+`triage eval --dry-run` prints the planned call count and cost estimate and
+executes nothing. `triage pool --dry-run` does the same for pool construction.
+
+## Data and licensing
+
+Source: [Customer Support on Twitter](https://www.kaggle.com/datasets/thoughtvector/customer-support-on-twitter)
+(`twcs`), uploaded 2017. The raw CSV is hosted on Kaggle; no Twitter/X API is
+involved.
+
+The dataset is **CC BY-NC-SA 4.0**. Redistribution of a labeled subset would be
+permitted, but this repo ships **IDs and labels only** — not thread text. Two
+reasons, recorded in [`docs/data-verification.md`](docs/data-verification.md):
+the non-commercial clause is ambiguous for a portfolio repo, and redistributing
+tweet text carries its own constraint independent of the Kaggle license.
+
+The practical consequence: reproducing the eval requires a Kaggle download and a
+local rebuild. That path is documented rather than hidden.
+
+No dataset text is committed. The test fixtures are hand-authored rows in the
+dataset's schema, not scraped records.
+
+## Methodology
+
+The parts most worth reading, because they are where an eval usually goes wrong:
+
+**Baseline at equal information.** Both arms build prompts from one shared
+fragments module. The baseline is a genuine single-prompt attempt at the same
+task with the same label definitions, not a strawman.
+
+**Gold labels are collected in three isolated passes.** One annotator labels
+category, then queue, then escalation — each a separate full sweep in its own
+seeded order. Labeling all three fields per thread anchors each field on the
+previous one, and that collapse would be invisible, because gold labels are what
+everything else is measured against. The isolation is structural: a pass cannot
+read another pass's file.
+
+**Pool selection must not correlate with difficulty.** A keyword stratifier was
+proposed and rejected twice: it admits only threads whose class is lexically
+obvious, so both arms inflate and the measured lift compresses toward zero.
+Disclosure was tried as a remedy and reverted. The reasoning is written up in
+[`docs/solutions/tooling-decisions/keyword-stratification-biases-eval-pool.md`](docs/solutions/tooling-decisions/keyword-stratification-biases-eval-pool.md).
+
+**Development and measurement models are decoupled.** All iteration runs on a
+cheap dev profile or mocks; only recorded runs use the measurement pair. The
+config asserts the judge model differs from the models it grades.
+
+**Cleaning rules are stated, not silent.** Threads with no diagnosable content
+are excluded from the eval set, and the excluded count is reported on every run.
+The full record is in [`data/eval/selection_log.md`](data/eval/selection_log.md).
+
+Project vocabulary is defined in [`CONCEPTS.md`](CONCEPTS.md).
+
+## Results
+
+Not yet measured. This section will carry the baseline-vs-pipeline comparison —
+per-class precision/recall, confusion matrix, paired bootstrap confidence
+intervals, draft-quality scores with judge-human agreement, and per-arm cost and
+latency — once the reference run is recorded, with every number traceable to the
+committed run artifact.
+
+## Limitations
+
+Stated now rather than after the numbers land:
+
+- **Escalation labels have no ground-truth proxy.** The dataset carries no
+  escalation signal, so every escalation label is a human judgment call.
+- **A single annotator produced all gold labels** and the judge-validation
+  subsample. There is no inter-annotator agreement figure, and there cannot be.
+- **The judge shares a provider with the models it grades.** A cross-provider
+  judge would force a second API key on anyone reproducing this.
+- **Rare-class strata are shaped by an imperfect classifier.** Candidates for a
+  rare class come from threads a cheap model already believed were that class, so
+  those strata skew toward cases that model finds legible. Bounded, and disclosed
+  rather than assumed away.
+- **Non-English threads** are present in the corpus and are not handled
+  specially.
+
+## Reproduction
+
+1. Clone, create the venv, `pip install -e ".[dev]"`.
+2. Set `ANTHROPIC_API_KEY`.
+3. `triage ingest` (needs a Kaggle token at `~/.kaggle/kaggle.json`).
+4. Rebuild the eval set from the shipped IDs and labels.
+5. `triage eval --dry-run` to see planned calls and cost, then run it.
+
+`pytest` requires none of the above — the suite is fully mocked and makes no
+network calls.
+
+## License
+
+The dataset is CC BY-NC-SA 4.0 and is not redistributed here. A license for the
+code in this repo has not been chosen yet.
