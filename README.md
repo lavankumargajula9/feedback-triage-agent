@@ -205,5 +205,8 @@ network calls.
 
 ## License
 
-The dataset is CC BY-NC-SA 4.0 and is not redistributed here. A license for the
-code in this repo has not been chosen yet.
+Code in this repo is MIT licensed — see [`LICENSE`](LICENSE).
+
+The dataset is CC BY-NC-SA 4.0 and is **not** redistributed here. The MIT grant
+covers this repo's code only; it does not extend to the `twcs` data, which you
+obtain from Kaggle under its own terms.
