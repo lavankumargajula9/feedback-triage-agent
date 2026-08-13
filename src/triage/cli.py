@@ -1128,15 +1128,18 @@ def _cmd_label(args: argparse.Namespace) -> int:
         print(f"\n{pass_.prompt}")
         for index, option in enumerate(options, start=1):
             print(f"  {index}. {option}")
-        choice = input("> ").strip()
-        if choice.lower() in {"q", "quit"}:
-            print("stopped; rerun the same command to resume.")
-            return EXIT_OK
-        try:
-            value = options[int(choice) - 1]
-        except (ValueError, IndexError):
-            print("unrecognized choice; stopping without recording it.", file=sys.stderr)
-            return EXIT_INPUT_ERROR
+        # Re-prompt rather than exit: this loop runs a few hundred times per
+        # pass, and int(choice)-1 would index backwards from the end on "0",
+        # recording a wrong gold label without complaining.
+        while True:
+            choice = input("> ").strip()
+            if choice.lower() in {"q", "quit"}:
+                print("stopped; rerun the same command to resume.")
+                return EXIT_OK
+            if choice.isdigit() and 1 <= int(choice) <= len(options):
+                value = options[int(choice) - 1]
+                break
+            print(f"enter 1-{len(options)}, or 'q' to stop.", file=sys.stderr)
         lh.record_answer(pass_, out_dir, item.thread_id, value)
 
     print(f"\npass '{pass_.name}' complete.")

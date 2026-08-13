@@ -611,6 +611,56 @@ class TestLabelCandidatesUsesTheFrozenPool:
         answered = list(lh.read_pass(lh.CATEGORY_PASS, tmp_path))
         assert answered == shuffled[:2]
 
+    def _one_thread_pool(self, conn, out_dir):
+        keep = [
+            tid
+            for tid in (r[0] for r in conn.execute("SELECT thread_id FROM threads"))
+            if degenerate_reason(get_thread(conn, tid)) is None
+        ][:1]
+        rough = {
+            tid: pool.RoughLabels("General Inquiry", "Tier-1 General", False)
+            for tid in keep
+        }
+        pool.write_pool(out_dir, keep, rough, {"selected": len(keep)})
+        return keep
+
+    def test_zero_does_not_silently_record_the_last_option(
+        self, db_path, tmp_path, monkeypatch
+    ):
+        # int("0") - 1 indexes backwards from the end, so "0" used to write the
+        # last label into the gold set with no error at all.
+        from triage.evals import label_helper as lh
+
+        conn = open_store(db_path)
+        self._one_thread_pool(conn, tmp_path)
+        answers = iter(["0", "-1", "1"])
+        monkeypatch.setattr("builtins.input", lambda *_: next(answers))
+
+        code = cli.main(
+            ["label", "--pass", "category", "--db", str(db_path), "--out", str(tmp_path)]
+        )
+        assert code == cli.EXIT_OK
+        recorded = list(lh.read_pass(lh.CATEGORY_PASS, tmp_path).values())
+        assert recorded == [fragments.CATEGORY_LABELS[0]]
+
+    def test_a_typo_reprompts_instead_of_ending_the_session(
+        self, db_path, tmp_path, monkeypatch, capsys
+    ):
+        from triage.evals import label_helper as lh
+
+        conn = open_store(db_path)
+        self._one_thread_pool(conn, tmp_path)
+        answers = iter(["", "9", "abc", "2"])
+        monkeypatch.setattr("builtins.input", lambda *_: next(answers))
+
+        code = cli.main(
+            ["label", "--pass", "category", "--db", str(db_path), "--out", str(tmp_path)]
+        )
+        assert code == cli.EXIT_OK
+        assert "enter 1-6" in capsys.readouterr().err
+        recorded = list(lh.read_pass(lh.CATEGORY_PASS, tmp_path).values())
+        assert recorded == [fragments.CATEGORY_LABELS[1]]
+
     def test_missing_pool_is_an_input_error(self, db_path, tmp_path, capsys):
         code = cli.main(
             ["label", "--pass", "category", "--db", str(db_path), "--out", str(tmp_path)]
