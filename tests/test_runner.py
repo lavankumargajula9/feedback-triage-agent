@@ -130,6 +130,13 @@ def run_args(tmp_path):
 
 
 class TestGoldLabelsLoader:
+    def test_shipped_smoke_fixture_passes_the_loader(self):
+        # CI's eval dry-run reads this fixture; nothing else did, so it drifted
+        # unnoticed through the taxonomy split and only CI went red.
+        fixture = FIXTURE_CSV.parent / "smoke_labels.csv"
+        labels = load_gold_labels(fixture)
+        assert labels
+
     def test_valid_labels_load(self, tmp_path):
         path = write_labels(
             tmp_path / "gold.csv",
