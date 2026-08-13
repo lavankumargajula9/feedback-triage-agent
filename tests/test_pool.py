@@ -273,6 +273,24 @@ def spread_rough(per_class):
     return rough
 
 
+class TestBucketKeys:
+    def test_every_support_key_is_a_declared_quota_key(self):
+        # Support keys and quota keys are looked up against each other. A
+        # second encoding of the scheme would not raise — the quotas would
+        # simply never be met — so pin that both sides agree.
+        quotas = set(pool.quota_buckets(1))
+        for category in fragments.CATEGORY_LABELS:
+            for queue in fragments.QUEUE_LABELS:
+                for escalate in (True, False):
+                    labels = pool.RoughLabels(category, queue, escalate)
+                    assert set(labels.buckets()) <= quotas
+
+    def test_escalate_buckets_use_the_shared_encoding(self):
+        labels = pool.RoughLabels("General Inquiry", "Tier-1 General", True)
+        assert labels.buckets()[2] in pool.ESCALATE_BUCKETS
+        assert pool.bucket_key(pool.BUCKET_ESCALATE, False) in pool.ESCALATE_BUCKETS
+
+
 class TestStratifiedSelect:
     def test_meets_every_floor_when_the_data_allows(self):
         rough = spread_rough(per_class=4)

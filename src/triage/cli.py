@@ -1083,13 +1083,8 @@ def _cmd_label(args: argparse.Namespace) -> int:
 def _label_candidates(conn, limit: int | None, out_dir: Path | str):
     """Labelable items read from the frozen candidate pool (U6, KTD8).
 
-    Only pool membership is read. The rough labels that drove stratification
-    live in a separate file and are deliberately not loaded here: showing the
-    annotator a model's guess would anchor the gold labels on it.
-
-    Degeneracy was already screened when the pool was built; it is re-checked
-    per thread because a re-ingest between freeze and labeling can change a
-    thread's text.
+    Membership only — never the rough labels. Degeneracy is re-checked because
+    a re-ingest between freeze and labeling can change a thread's text.
     """
     from triage.evals.label_helper import LabelItem
     from triage.tools.retrieval import degenerate_reason, get_thread_by_id, render_thread

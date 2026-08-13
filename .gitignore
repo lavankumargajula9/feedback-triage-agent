@@ -23,5 +23,8 @@ data/raw/
 data/*.db
 data/**/*.db
 
+# Run logs
+*.log
+
 # Env / secrets
 .env

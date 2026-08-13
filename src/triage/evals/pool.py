@@ -1,37 +1,21 @@
 """Candidate-pool construction for the eval set (U6, KTD8; R11, R30).
 
-Labeling cannot iterate the whole store: the real corpus is ~901k threads, and
-a per-thread fetch to decide labelability is ~901k round-trips. This module
-builds the pool once, freezes it, and lets ``triage label`` read the frozen
-membership instead.
+Labeling cannot iterate the whole store, so the pool is built once, frozen, and
+read back by ``triage label``. Stages: structural prefilter (SQL) -> seeded
+uniform sample -> degeneracy screen -> rough classification on the dev profile
+-> stratified selection toward per-class floors.
 
-Four stages, each narrowing on a different kind of evidence:
+Two invariants the code cannot show:
 
-1. **Structural prefilter** (SQL, one grouped scan). Class-neutral facts only —
-   does a customer tweet exist, is there enough raw customer text to be
-   diagnosable at all. The character floor is derived from
-   ``MIN_DIAGNOSABLE_WORDS`` so it can only ever admit threads the authoritative
-   predicate would also consider; it never rejects one the predicate accepts.
-   That property is what lets this be a pure performance step.
-2. **Seeded scan sample**. The volume reduction (corpus -> scan size) is a
-   uniform random draw, not a content rule. Nothing about a thread's wording
-   changes its odds of being scanned.
-3. **Degeneracy screen** using ``degenerate_reason`` itself, over the sample
-   only. Degeneracy keeps exactly one definition (R28); SQL never re-implements
-   it.
-4. **Rough classification** on the dev profile (R30), then stratified selection
-   toward per-class floors.
+- The SQL character floor may only ever OVER-admit relative to
+  ``degenerate_reason``, which stays the single definition of degeneracy (R28).
+  Cleaning only removes characters, which is what makes the floor safe to apply
+  ahead of the real predicate.
+- Pool membership and the rough labels are written to separate files, so the
+  labeling path cannot put a model guess in front of the annotator.
 
-Why a model rough-classifies rather than a keyword rule: a keyword rule *admits
-only* threads whose class is lexically obvious, so the ambiguous ones never
-reach the pool at all. The rough classifier assigns every scanned thread to some
-class, so a thread it reads wrongly still enters the pool — in the wrong
-stratum, where the human labeler corrects it. Pool membership therefore does not
-select for lexical obviousness. See
+Why a model rough-classifies rather than a keyword rule:
 ``docs/solutions/tooling-decisions/keyword-stratification-biases-eval-pool.md``.
-
-The rough labels are never gold labels and are written to a different file than
-pool membership, so the labeling path cannot show an annotator a model guess.
 """
 
 from __future__ import annotations
@@ -51,6 +35,7 @@ from triage import config
 from triage.evals.cache import CachingClient, CallCache, call_cost
 from triage.ingest.store import get_thread
 from triage.prompts import fragments
+from triage.tools.llm import call_with_schema
 from triage.tools.retrieval import MIN_DIAGNOSABLE_WORDS, clean_text, degenerate_reason
 from triage.tools.schemas import CategoryLabel, OutputFailure, QueueLabel
 
@@ -90,18 +75,35 @@ CRITERION_ROUGH_FAILED = "rough_classify_failed"
 CRITERION_NOT_SELECTED = "not_selected_by_stratification"
 CRITERION_EXCLUDED = "excluded_by_caller"
 
-ESCALATE_BUCKETS = ("escalate:true", "escalate:false")
+BUCKET_CATEGORY = "category"
+BUCKET_QUEUE = "queue"
+BUCKET_ESCALATE = "escalate"
+
+
+def bucket_key(kind: str, value: Any) -> str:
+    """The one encoding of a quota-bucket name.
+
+    Support keys and quota keys are looked up against each other, so a second
+    encoding of this scheme would not raise — the quotas would simply never be
+    met.
+    """
+    if isinstance(value, bool):
+        value = str(value).lower()
+    return f"{kind}:{value}"
+
+
+ESCALATE_BUCKETS = (
+    bucket_key(BUCKET_ESCALATE, True),
+    bucket_key(BUCKET_ESCALATE, False),
+)
 
 
 class PoolError(Exception):
     """Raised when a pool cannot be built, read, or is missing entirely."""
 
 
-# ---------------------------------------------------------------------------
-# Rough-pass schemas — bare labels, no rationale. The rationale field the
-# pipeline schemas carry would multiply this pass's output tokens by ~10 for a
-# judgement no downstream consumer reads.
-# ---------------------------------------------------------------------------
+# Rough-pass schemas: bare labels. The pipeline schemas' rationale field would
+# multiply this pass's output tokens for a judgement nothing downstream reads.
 
 
 class RoughCategory(BaseModel):
@@ -126,10 +128,8 @@ class RoughEscalate(BaseModel):
 class RoughPass:
     """One rough-classification sweep over the scan pool.
 
-    Separate passes per field for the same reason the hand-labeling helper
-    sweeps separately: a combined call anchors queue on the category just
-    chosen, and stratifying on an anchored queue would under-represent exactly
-    the category/queue divergence the split taxonomy exists to measure.
+    One field per sweep: a combined call would anchor queue on the category
+    just chosen, under-representing category/queue divergence in the pool.
     """
 
     name: str
@@ -175,9 +175,9 @@ class RoughLabels:
     def buckets(self) -> tuple[str, str, str]:
         """The three quota buckets this thread contributes to."""
         return (
-            f"category:{self.category}",
-            f"queue:{self.queue}",
-            f"escalate:{str(self.escalate).lower()}",
+            bucket_key(BUCKET_CATEGORY, self.category),
+            bucket_key(BUCKET_QUEUE, self.queue),
+            bucket_key(BUCKET_ESCALATE, self.escalate),
         )
 
 
@@ -281,12 +281,7 @@ def opening_message(thread: Any) -> str:
 
 
 def _rough_system(pass_: RoughPass) -> str:
-    """A deliberately minimal system prompt — bare label names, no definitions.
-
-    The pipeline's full definitions would roughly triple this pass's input
-    tokens for a guess that only picks a stratum and is overwritten by the
-    human labeler.
-    """
+    """Bare label names, no definitions — the guess only picks a stratum."""
     parts = [
         "You sort customer-support threads into buckets. Answer with the label only.",
     ]
@@ -308,8 +303,6 @@ def rough_classify(
     A thread whose any field fails after retries is dropped from the pool rather
     than guessed into a stratum (R27 keeps the failure typed, not raised).
     """
-    from triage.tools.llm import call_with_schema
-
     collected: dict[int, dict[str, Any]] = {tid: {} for tid, _ in survivors}
     failed: set[int] = set()
     failures: Counter = Counter()
@@ -381,9 +374,14 @@ def estimate_scan_cost(
 
 def quota_buckets(floor: int) -> dict[str, int]:
     """Every bucket that carries a minimum-support floor (R11)."""
-    buckets = {f"category:{label}": floor for label in fragments.CATEGORY_LABELS}
-    buckets.update({f"queue:{label}": floor for label in fragments.QUEUE_LABELS})
-    buckets.update({bucket: floor for bucket in ESCALATE_BUCKETS})
+    buckets = {
+        bucket_key(BUCKET_CATEGORY, label): floor
+        for label in fragments.CATEGORY_LABELS
+    }
+    buckets.update(
+        {bucket_key(BUCKET_QUEUE, label): floor for label in fragments.QUEUE_LABELS}
+    )
+    buckets.update(dict.fromkeys(ESCALATE_BUCKETS, floor))
     return buckets
 
 
@@ -461,12 +459,7 @@ def write_pool(
     rough: dict[int, RoughLabels],
     stats: dict[str, Any],
 ) -> None:
-    """Freeze the pool: membership, rough labels, and stats in separate files.
-
-    Membership and rough labels are separate files so that the labeling path,
-    which reads membership only, cannot put a model's guess in front of the
-    annotator.
-    """
+    """Freeze the pool: membership, rough labels, and stats in separate files."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
