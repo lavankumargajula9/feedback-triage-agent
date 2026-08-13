@@ -1,4 +1,4 @@
-"""Headless CLI (R7): ``triage ingest``, ``triage run``, and ``triage eval``.
+"""Headless CLI (R7): ``triage ingest``, ``run``, ``pool``, ``label``, ``eval``.
 
 ``triage run`` processes one thread (or a batch) end-to-end through the
 LangGraph pipeline and emits the structured triage result as JSON, with
@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from triage.evals import pool as pool_mod
 from triage.ingest.download import DATASET_HANDLE, DEFAULT_CSV_PATH
 
 # The bundled sample fixture lives in the repo, resolved relative to this file
@@ -138,6 +139,60 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=f"path to the SQLite store (default: {DEFAULT_DB_PATH})",
+    )
+
+    pool = subparsers.add_parser(
+        "pool",
+        help="Build and freeze the stratified candidate pool the eval set is labeled from.",
+        description=(
+            "Candidate-pool construction (U6, KTD8; R11, R30). Narrows the corpus with a "
+            "class-neutral structural filter, takes a seeded uniform sample, screens "
+            "degenerate threads, rough-classifies the survivors on the DEV profile, and "
+            "selects toward per-class floors. Prints the funnel and an itemized cost "
+            "before spending; --dry-run stops there. Rough labels are a stratification "
+            "aid only and are never shown to the annotator."
+        ),
+    )
+    pool.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help=f"path to the SQLite store (default: {DEFAULT_DB_PATH})",
+    )
+    pool.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help=f"directory the frozen pool is written to (default: {DEFAULT_LABEL_DIR})",
+    )
+    pool.add_argument(
+        "--scan-size",
+        type=int,
+        default=pool_mod.DEFAULT_SCAN_SIZE,
+        help=f"threads to rough-classify (default: {pool_mod.DEFAULT_SCAN_SIZE})",
+    )
+    pool.add_argument(
+        "--target-n",
+        type=int,
+        default=pool_mod.DEFAULT_TARGET_N,
+        help=f"minimum pool size after quotas (default: {pool_mod.DEFAULT_TARGET_N})",
+    )
+    pool.add_argument(
+        "--floor",
+        type=int,
+        default=pool_mod.DEFAULT_CLASS_FLOOR,
+        help=f"minimum support per class (default: {pool_mod.DEFAULT_CLASS_FLOOR})",
+    )
+    pool.add_argument(
+        "--cache",
+        type=Path,
+        default=None,
+        help="LLM cache for the rough pass (default: <out>/pool_cache.db)",
+    )
+    pool.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the funnel and cost estimate, then stop without any model call",
     )
 
     label = subparsers.add_parser(
@@ -885,6 +940,80 @@ def _eval_judge_and_gate(
     return EXIT_OK
 
 
+def _cmd_pool(args: argparse.Namespace, *, client: Any = None) -> int:
+    """Build and freeze the stratified candidate pool (U6, KTD8; R11, R30)."""
+    from triage.config import DEV, ROLE_PIPELINE, get_model
+
+    out_dir = args.out or DEFAULT_LABEL_DIR
+    try:
+        conn = _open_existing_store(args.db or DEFAULT_DB_PATH)
+    except InputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_ERROR
+
+    # R30 pins the stratifier to the dev profile; there is deliberately no
+    # --profile flag, so a measurement model cannot select the eval pool.
+    model = get_model(ROLE_PIPELINE, DEV)
+
+    prep = pool_mod.prepare_scan(conn, scan_size=args.scan_size)
+    if not prep.survivors:
+        print("error: no labelable threads survived the scan.", file=sys.stderr)
+        return EXIT_INPUT_ERROR
+
+    print(f"corpus threads:          {prep.corpus_threads}")
+    print(f"structurally eligible:   {len(prep.eligible)}")
+    print(f"sampled for scan:        {len(prep.scanned)}")
+    print(f"survived degeneracy:     {len(prep.survivors)}")
+    for criterion, count in sorted(prep.rejections.items()):
+        print(f"  rejected [{criterion}]: {count}")
+
+    estimate = pool_mod.estimate_scan_cost(len(prep.survivors), model=model)
+    print(f"\nrough pass on {model} (dev profile, R30):")
+    print(
+        f"  {estimate['threads']} threads x {estimate['passes']} passes "
+        f"= {estimate['calls']} calls"
+    )
+    print(
+        f"  in:  {estimate['calls']} x {estimate['tokens_in_per_call']} tok "
+        f"= {estimate['tokens_in_total']} tok"
+    )
+    print(
+        f"  out: {estimate['calls']} x {estimate['tokens_out_per_call']} tok "
+        f"= {estimate['tokens_out_total']} tok"
+    )
+    if estimate["cost"] is None:
+        print(f"  cost: UNPRICED — no price on file for {model}")
+    else:
+        print(
+            f"  cost: ${estimate['cost_before_retries']:.2f} x "
+            f"{estimate['retry_factor']} retry = ${estimate['cost']:.2f}"
+        )
+
+    if args.dry_run:
+        print("\ndry run: no model calls made.")
+        return EXIT_OK
+
+    stats = pool_mod.build_pool(
+        conn,
+        out_dir=out_dir,
+        target_n=args.target_n,
+        floor=args.floor,
+        cache_path=args.cache,
+        client=client,
+        model=model,
+        prep=prep,
+    )
+
+    print(f"\nrough-classified: {stats['rough_classified']}")
+    print(f"selected:         {stats['selected']} (target {stats['target_n']})")
+    if stats["shortfalls"]:
+        print("class floors NOT met (recorded, not silently dropped):")
+        for bucket, achieved in sorted(stats["shortfalls"].items()):
+            print(f"  {bucket}: {achieved}/{stats['class_floor']}")
+    print(f"frozen to {Path(out_dir) / pool_mod.POOL_FILE}")
+    return EXIT_OK
+
+
 def _cmd_label(args: argparse.Namespace) -> int:
     """Run one labeling pass, or merge the three completed passes (U6)."""
     from triage.evals import label_helper as lh
@@ -912,9 +1041,13 @@ def _cmd_label(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_INPUT_ERROR
 
-    items, excluded = _label_candidates(conn, args.limit)
+    try:
+        items, excluded = _label_candidates(conn, args.limit, out_dir)
+    except pool_mod.PoolError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_ERROR
     if not items:
-        print("error: no labelable threads in the store.", file=sys.stderr)
+        print("error: no labelable threads in the frozen pool.", file=sys.stderr)
         return EXIT_INPUT_ERROR
     pending = lh.pending_items(pass_, out_dir, items)
 
@@ -947,31 +1080,30 @@ def _cmd_label(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _label_candidates(conn, limit: int | None):
-    """Labelable items keyed by store thread_id, plus the excluded count.
+def _label_candidates(conn, limit: int | None, out_dir: Path | str):
+    """Labelable items read from the frozen candidate pool (U6, KTD8).
 
-    Degenerate threads are excluded from the eval set (R11); the count is
-    reported so the cleaning rule is disclosed rather than silent.
+    Only pool membership is read. The rough labels that drove stratification
+    live in a separate file and are deliberately not loaded here: showing the
+    annotator a model's guess would anchor the gold labels on it.
+
+    Degeneracy was already screened when the pool was built; it is re-checked
+    per thread because a re-ingest between freeze and labeling can change a
+    thread's text.
     """
     from triage.evals.label_helper import LabelItem
-    from triage.tools.retrieval import (
-        degenerate_reason,
-        get_thread_by_id,
-        list_threads,
-        render_thread,
-    )
+    from triage.tools.retrieval import degenerate_reason, get_thread_by_id, render_thread
 
-    total = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
-    rows = list_threads(conn, limit=limit or total)
+    thread_ids = pool_mod.read_pool(out_dir)
+    if limit is not None:
+        thread_ids = thread_ids[:limit]
     items, excluded = [], 0
-    for row in rows:
-        thread = get_thread_by_id(conn, row["thread_id"])
+    for thread_id in thread_ids:
+        thread = get_thread_by_id(conn, thread_id)
         if degenerate_reason(thread) is not None:
             excluded += 1
             continue
-        items.append(
-            LabelItem(thread_id=row["thread_id"], text=render_thread(thread))
-        )
+        items.append(LabelItem(thread_id=thread_id, text=render_thread(thread)))
     return tuple(items), excluded
 
 
@@ -985,6 +1117,8 @@ def main(argv: list[str] | None = None, *, client: Any = None) -> int:
         return _cmd_run(args, client=client)
     if args.command == "eval":
         return _cmd_eval(args, client=client)
+    if args.command == "pool":
+        return _cmd_pool(args, client=client)
     if args.command == "label":
         return _cmd_label(args)
     parser.print_help()

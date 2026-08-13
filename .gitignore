@@ -16,9 +16,12 @@ dist/
 .ruff_cache/
 .mypy_cache/
 
-# Data (raw downloads and generated SQLite stores are not committed)
+# Data (raw downloads and generated SQLite stores are not committed).
+# The frozen eval artifacts under data/eval/ ARE committed — they are the
+# evidence behind the selection log — but no generated store or LLM cache is.
 data/raw/
 data/*.db
+data/**/*.db
 
 # Env / secrets
 .env
