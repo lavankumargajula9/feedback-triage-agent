@@ -190,6 +190,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="LLM cache for the rough pass (default: <out>/pool_cache.db)",
     )
     pool.add_argument(
+        "--exclude",
+        type=Path,
+        default=None,
+        help="CSV of thread_ids to keep out of the pool (e.g. the U5 pilot threads, KTD8)",
+    )
+    pool.add_argument(
+        "--force",
+        action="store_true",
+        help="replace an existing pool even when labeling has started against it",
+    )
+    pool.add_argument(
         "--dry-run",
         action="store_true",
         help="print the funnel and cost estimate, then stop without any model call",
@@ -239,7 +250,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--limit",
         type=int,
         default=None,
-        help="label at most this many threads (default: all)",
+        help="stop after this many threads in this sitting (default: the whole pool)",
     )
 
     evaluate = subparsers.add_parser(
@@ -940,6 +951,29 @@ def _eval_judge_and_gate(
     return EXIT_OK
 
 
+def _read_thread_ids(path: Path) -> set[int]:
+    """Thread ids from a one-column CSV, with or without a ``thread_id`` header."""
+    import csv
+
+    if not path.is_file():
+        raise InputError(f"no such file: {path}")
+    ids: set[int] = set()
+    with open(path, encoding="utf-8", newline="") as handle:
+        for row in csv.reader(handle):
+            if not row or not row[0].strip():
+                continue
+            field = row[0].strip()
+            if field == "thread_id":
+                continue
+            try:
+                ids.add(int(field))
+            except ValueError:
+                raise InputError(f"{path}: {field!r} is not a thread id") from None
+    if not ids:
+        raise InputError(f"{path} contains no thread ids")
+    return ids
+
+
 def _cmd_pool(args: argparse.Namespace, *, client: Any = None) -> int:
     """Build and freeze the stratified candidate pool (U6, KTD8; R11, R30)."""
     from triage.config import DEV, ROLE_PIPELINE, get_model
@@ -955,7 +989,14 @@ def _cmd_pool(args: argparse.Namespace, *, client: Any = None) -> int:
     # --profile flag, so a measurement model cannot select the eval pool.
     model = get_model(ROLE_PIPELINE, DEV)
 
-    prep = pool_mod.prepare_scan(conn, scan_size=args.scan_size)
+    try:
+        pool_mod.assert_freezable(out_dir, force=args.force)
+        exclude = _read_thread_ids(args.exclude) if args.exclude else None
+    except (pool_mod.PoolError, InputError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_INPUT_ERROR
+
+    prep = pool_mod.prepare_scan(conn, scan_size=args.scan_size, exclude=exclude)
     if not prep.survivors:
         print("error: no labelable threads survived the scan.", file=sys.stderr)
         return EXIT_INPUT_ERROR
@@ -1002,9 +1043,19 @@ def _cmd_pool(args: argparse.Namespace, *, client: Any = None) -> int:
         client=client,
         model=model,
         prep=prep,
+        force=args.force,
     )
 
+    if not stats["selected"]:
+        print("error: nothing was selected; no pool frozen.", file=sys.stderr)
+        return EXIT_PIPELINE_FAILURE
+
     print(f"\nrough-classified: {stats['rough_classified']}")
+    if stats["rough_unclassified"]:
+        print(
+            f"unclassified:     {stats['rough_unclassified']} "
+            f"(rough pass failed; still eligible, no stratum)"
+        )
     print(f"selected:         {stats['selected']} (target {stats['target_n']})")
     if stats["shortfalls"]:
         print("class floors NOT met (recorded, not silently dropped):")
@@ -1042,14 +1093,19 @@ def _cmd_label(args: argparse.Namespace) -> int:
         return EXIT_INPUT_ERROR
 
     try:
-        items, excluded = _label_candidates(conn, args.limit, out_dir)
+        items, excluded = _label_candidates(conn, out_dir)
     except pool_mod.PoolError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_INPUT_ERROR
     if not items:
         print("error: no labelable threads in the frozen pool.", file=sys.stderr)
         return EXIT_INPUT_ERROR
+
+    # Limit after the pass shuffle, never before: slicing the id-ordered pool
+    # would make a part-finished pass a biased subset of it.
     pending = lh.pending_items(pass_, out_dir, items)
+    if args.limit is not None:
+        pending = pending[: args.limit]
 
     if excluded:
         print(f"excluded {excluded} thread(s) with no diagnosable content (R11)")
@@ -1080,21 +1136,25 @@ def _cmd_label(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _label_candidates(conn, limit: int | None, out_dir: Path | str):
+def _label_candidates(conn, out_dir: Path | str):
     """Labelable items read from the frozen candidate pool (U6, KTD8).
 
     Membership only — never the rough labels. Degeneracy is re-checked because
     a re-ingest between freeze and labeling can change a thread's text.
     """
     from triage.evals.label_helper import LabelItem
+    from triage.ingest.store import IngestError
     from triage.tools.retrieval import degenerate_reason, get_thread_by_id, render_thread
 
-    thread_ids = pool_mod.read_pool(out_dir)
-    if limit is not None:
-        thread_ids = thread_ids[:limit]
     items, excluded = [], 0
-    for thread_id in thread_ids:
-        thread = get_thread_by_id(conn, thread_id)
+    for thread_id in pool_mod.read_pool(out_dir):
+        try:
+            thread = get_thread_by_id(conn, thread_id)
+        except IngestError as exc:
+            raise pool_mod.PoolError(
+                f"frozen pool references thread {thread_id}, absent from this store "
+                f"({exc}); rebuild the pool or point --db at the store it was built from"
+            ) from None
         if degenerate_reason(thread) is not None:
             excluded += 1
             continue

@@ -106,15 +106,38 @@ def add_thread(store, *, root, author, text, inbound=1):
     return thread_id
 
 
+def add_inbound_tweets(store, *, root, author, texts):
+    """Append a thread of several inbound tweets, returning its thread id."""
+    store.execute(
+        "INSERT INTO threads (root_tweet_id, customer_author_id, truncated, "
+        "cycle_flagged) VALUES (?, ?, 0, 0)",
+        (root, author),
+    )
+    thread_id = store.execute("SELECT last_insert_rowid()").fetchone()[0]
+    for position, text in enumerate(texts):
+        tweet_id = root + position
+        store.execute(
+            "INSERT INTO tweets (tweet_id, author_id, inbound, created_at, text) "
+            "VALUES (?, ?, 1, 'Tue Oct 31 22:00:00 +0000 2017', ?)",
+            (tweet_id, author, text),
+        )
+        store.execute(
+            "INSERT INTO thread_tweets (thread_id, position, tweet_id) VALUES (?, ?, ?)",
+            (thread_id, position, tweet_id),
+        )
+    store.commit()
+    return thread_id
+
+
 class TestStructuralPrefilter:
     def test_admits_every_thread_the_real_predicate_accepts(self, store):
-        # The safety property the whole design rests on: the SQL floor is a
-        # performance step, so it must never reject a thread degenerate_reason
-        # would have accepted. Seeded with short-but-diagnosable text, which is
-        # where an over-eager floor would break the property.
+        # The property the design rests on: the SQL floor must never reject a
+        # thread degenerate_reason accepts.
         add_thread(store, root=9300, author="700", text="app crashed today")
         add_thread(store, root=9301, author="701", text="a b c")
         add_thread(store, root=9302, author="702", text="I have sent you a DM just now")
+        add_inbound_tweets(store, root=9310, author="703", texts=["a", "b", "c"])
+        add_inbound_tweets(store, root=9320, author="704", texts=["ab", "c"])
 
         eligible = set(pool.structural_prefilter(store)[0])
         all_ids = [row[0] for row in store.execute("SELECT thread_id FROM threads")]
@@ -140,12 +163,25 @@ class TestStructuralPrefilter:
         assert rejected[pool.CRITERION_TEXT_BELOW_FLOOR] == 1
 
     def test_floor_derives_from_the_diagnosable_word_minimum(self):
-        # Three content words need at least three characters plus two
-        # separators; a lower floor than this would start rejecting threads
-        # the real predicate accepts.
         from triage.tools.retrieval import MIN_DIAGNOSABLE_WORDS
 
-        assert pool.MIN_CUSTOMER_CHARS == 2 * MIN_DIAGNOSABLE_WORDS - 1
+        assert pool.MIN_CUSTOMER_CHARS == MIN_DIAGNOSABLE_WORDS
+
+    @pytest.mark.parametrize(
+        "texts",
+        [
+            ["a", "b", "c"],
+            ["a", "b", "c", "d"],
+            ["ab", "c"],
+            ["a", "bc"],
+            ["app crashed", "today"],
+        ],
+    )
+    def test_floor_admits_multi_tweet_threads_the_predicate_accepts(self, texts):
+        thread = make_thread(texts, inbound_flags=[True] * len(texts))
+        raw_chars = sum(len(t.text) for t in thread.tweets if t.inbound)
+        if degenerate_reason(thread) is None:
+            assert raw_chars >= pool.MIN_CUSTOMER_CHARS
 
 
 class TestScanSample:
@@ -179,7 +215,7 @@ class TestDegeneracyScreen:
         assert deflected in eligible
 
         survivors, rejected = pool.screen_degenerate(store, eligible)
-        assert rejected[pool.CRITERION_DEGENERATE] == 1
+        assert rejected[f"{pool.CRITERION_DEGENERATE}:dm_deflected"] == 1
         assert all(tid != deflected for tid, _ in survivors)
         assert len(survivors) == len(eligible) - 1
 
@@ -219,21 +255,34 @@ class TestRoughClassify:
         survivors = [(1, "payment failed")]
         answers = {"payment failed": rough_of("Billing/Payments", "Billing Ops", True)}
         client = RoughClient(answers)
-        rough, failures = pool.rough_classify(
+        rough, failures, unclassified = pool.rough_classify(
             survivors, model="claude-haiku-4-5", client=client
         )
         assert rough[1] == pool.RoughLabels("Billing/Payments", "Billing Ops", True)
         assert not failures
+        assert unclassified == []
 
-    def test_a_failed_field_drops_the_thread_and_is_counted(self):
+    def test_a_failed_field_yields_no_stratum_but_keeps_the_thread(self):
+        # Refusals correlate with content, so admission must not depend on the
+        # rough model succeeding.
         survivors = [(1, "payment failed")]
         answers = {"payment failed": rough_of("Billing/Payments", "Billing Ops", True)}
         client = RoughClient(answers, refuse={("payment failed", "queue")})
-        rough, failures = pool.rough_classify(
+        rough, failures, unclassified = pool.rough_classify(
             survivors, model="claude-haiku-4-5", client=client
         )
         assert rough == {}
         assert failures[f"{pool.CRITERION_ROUGH_FAILED}:queue"] == 1
+        assert unclassified == [1]
+
+    def test_unclassified_threads_can_still_be_selected(self):
+        rough = {1: pool.RoughLabels("General Inquiry", "Tier-1 General", False)}
+        selected, support, _ = pool.stratified_select(
+            rough, target_n=2, floor=1, top_up_only=[99]
+        )
+        assert 99 in selected
+        # It carries no stratum, so it must not inflate any quota.
+        assert support[pool.bucket_key(pool.BUCKET_CATEGORY, "General Inquiry")] == 1
 
     def test_queue_pass_never_sees_the_category_answer(self):
         # Structural isolation, the same guarantee the hand-labeling helper
@@ -371,6 +420,30 @@ class TestFreezeAndRead:
         pool.write_pool(tmp_path, [], {}, {"selected": 0, "shortfalls": {}})
         assert json.loads((tmp_path / pool.STATS_FILE).read_text())["selected"] == 0
 
+    def test_refuses_to_replace_a_pool_being_labeled(self, tmp_path):
+        # Pass files key answers by thread id, so a re-freeze would leave them
+        # describing threads the new pool does not contain.
+        (tmp_path / "pass_category.csv").write_text(
+            "thread_id,category\n1,General Inquiry\n", encoding="utf-8"
+        )
+        rough = {1: pool.RoughLabels("General Inquiry", "Tier-1 General", False)}
+        with pytest.raises(pool.PoolError, match="labeling has already started"):
+            pool.write_pool(tmp_path, [1], rough, {"selected": 1})
+
+    def test_force_replaces_a_pool_being_labeled(self, tmp_path):
+        (tmp_path / "pass_category.csv").write_text(
+            "thread_id,category\n1,General Inquiry\n", encoding="utf-8"
+        )
+        rough = {1: pool.RoughLabels("General Inquiry", "Tier-1 General", False)}
+        pool.write_pool(tmp_path, [1], rough, {"selected": 1}, force=True)
+        assert pool.read_pool(tmp_path) == [1]
+
+    def test_unclassified_selection_writes_a_blank_rough_row(self, tmp_path):
+        pool.write_pool(tmp_path, [7], {}, {"selected": 1})
+        with open(tmp_path / pool.ROUGH_FILE, encoding="utf-8", newline="") as handle:
+            row = next(csv.DictReader(handle))
+        assert row == {"thread_id": "7", "category": "", "queue": "", "escalate": ""}
+
     def test_missing_pool_raises_with_an_instructive_message(self, tmp_path):
         with pytest.raises(pool.PoolError, match="triage pool"):
             pool.read_pool(tmp_path)
@@ -435,7 +508,7 @@ class TestLabelCandidatesUsesTheFrozenPool:
         }
         pool.write_pool(tmp_path, keep, rough, {"selected": len(keep)})
 
-        items, _excluded = cli._label_candidates(conn, None, tmp_path)
+        items, _excluded = cli._label_candidates(conn, tmp_path)
         assert [item.thread_id for item in items] == keep
 
     def test_shown_text_never_carries_the_rough_label(self, db_path, tmp_path):
@@ -447,10 +520,17 @@ class TestLabelCandidatesUsesTheFrozenPool:
         rough = {tid: pool.RoughLabels("Billing/Payments", "Billing Ops", True) for tid in keep}
         pool.write_pool(tmp_path, keep, rough, {"selected": len(keep)})
 
-        items, _ = cli._label_candidates(conn, None, tmp_path)
+        items, _ = cli._label_candidates(conn, tmp_path)
         for item in items:
             assert "Billing/Payments" not in item.text
             assert "Billing Ops" not in item.text
+
+    def test_stale_pool_id_is_a_pool_error_not_a_traceback(self, db_path, tmp_path):
+        conn = open_store(db_path)
+        rough = {999999: pool.RoughLabels("General Inquiry", "Tier-1 General", False)}
+        pool.write_pool(tmp_path, [999999], rough, {"selected": 1})
+        with pytest.raises(pool.PoolError, match="absent from this store"):
+            cli._label_candidates(conn, tmp_path)
 
     def test_missing_pool_is_an_input_error(self, db_path, tmp_path, capsys):
         code = cli.main(
@@ -496,3 +576,40 @@ class TestPoolCli:
     def test_missing_store_is_an_input_error(self, tmp_path, capsys):
         code = cli.main(["pool", "--db", str(tmp_path / "nope.db")])
         assert code == cli.EXIT_INPUT_ERROR
+
+    def test_refuses_to_rebuild_over_an_in_progress_labeling(
+        self, db_path, tmp_path, capsys
+    ):
+        # The guard must fire before the rough pass, not after it.
+        (tmp_path / "pass_category.csv").write_text(
+            "thread_id,category\n1,General Inquiry\n", encoding="utf-8"
+        )
+
+        class ExplodingClient:
+            @property
+            def messages(self):
+                raise AssertionError("must refuse before any model call")
+
+        code = cli.main(
+            ["pool", "--db", str(db_path), "--out", str(tmp_path)],
+            client=ExplodingClient(),
+        )
+        assert code == cli.EXIT_INPUT_ERROR
+        assert "labeling has already started" in capsys.readouterr().err
+
+    def test_exclude_list_keeps_threads_out_of_the_scan(self, db_path, tmp_path):
+        conn = open_store(db_path)
+        all_ids = [row[0] for row in conn.execute("SELECT thread_id FROM threads")]
+        excluded = all_ids[0]
+        listing = tmp_path / "pilot.csv"
+        listing.write_text(f"thread_id\n{excluded}\n", encoding="utf-8")
+
+        ids = cli._read_thread_ids(listing)
+        assert ids == {excluded}
+        prep = pool.prepare_scan(conn, scan_size=100, exclude=ids)
+        assert all(tid != excluded for tid, _ in prep.survivors)
+        assert prep.rejections[pool.CRITERION_EXCLUDED] == 1
+
+    def test_exclude_file_must_exist(self, tmp_path):
+        with pytest.raises(cli.InputError, match="no such file"):
+            cli._read_thread_ids(tmp_path / "missing.csv")

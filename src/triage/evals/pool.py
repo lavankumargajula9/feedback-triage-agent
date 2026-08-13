@@ -60,12 +60,10 @@ EST_TOKENS_IN = 240
 EST_TOKENS_OUT = 10
 EST_RETRY_FACTOR = 1.10
 
-# A content word needs at least one character, and three of them need two
-# separators, so raw customer text shorter than this cannot clear
-# MIN_DIAGNOSABLE_WORDS however it is cleaned. Cleaning only ever removes
-# characters, which is what makes the SQL floor safe to apply before the real
-# predicate runs.
-MIN_CUSTOMER_CHARS = 2 * MIN_DIAGNOSABLE_WORDS - 1
+# One raw alpha character per content word. Not more: the predicate joins
+# cleaned inbound tweets with spaces, so its text can be longer than the raw
+# sum, and a floor counting those separators rejects threads it accepts.
+MIN_CUSTOMER_CHARS = MIN_DIAGNOSABLE_WORDS
 
 CRITERION_NO_CUSTOMER_TWEET = "no_customer_tweet"
 CRITERION_TEXT_BELOW_FLOOR = "customer_text_below_floor"
@@ -258,11 +256,27 @@ def screen_degenerate(
             rejected[CRITERION_EXCLUDED] += 1
             continue
         thread = get_thread(conn, thread_id)
-        if degenerate_reason(thread) is not None:
-            rejected[CRITERION_DEGENERATE] += 1
+        reason = degenerate_reason(thread)
+        if reason is not None:
+            rejected[f"{CRITERION_DEGENERATE}:{_degenerate_slug(reason)}"] += 1
             continue
         survivors.append((thread_id, opening_message(thread)))
     return survivors, rejected
+
+
+_DEGENERATE_SLUGS = (
+    ("no customer text", "empty_after_cleaning"),
+    ("too short", "below_word_minimum"),
+    ("deflected to DM", "dm_deflected"),
+)
+
+
+def _degenerate_slug(reason: str) -> str:
+    """A stable counter key for one degeneracy reason (R11 disclosure)."""
+    for needle, slug in _DEGENERATE_SLUGS:
+        if needle in reason:
+            return slug
+    return "other"
 
 
 def opening_message(thread: Any) -> str:
@@ -297,11 +311,13 @@ def rough_classify(
     model: str,
     client: Any,
     passes: tuple[RoughPass, ...] = ROUGH_PASSES,
-) -> tuple[dict[int, RoughLabels], Counter]:
-    """Rough per-field labels for each survivor, plus per-field failure counts.
+) -> tuple[dict[int, RoughLabels], Counter, list[int]]:
+    """Rough per-field labels per survivor, failure counts, and unclassified ids.
 
-    A thread whose any field fails after retries is dropped from the pool rather
-    than guessed into a stratum (R27 keeps the failure typed, not raised).
+    A thread whose field fails after retries gets no stratum rather than a
+    fabricated one (R27 keeps the failure typed, not raised). Its id is returned
+    so admission does not depend on the model succeeding: refusals correlate
+    with content, so dropping them outright would bias the pool.
     """
     collected: dict[int, dict[str, Any]] = {tid: {} for tid, _ in survivors}
     failed: set[int] = set()
@@ -327,15 +343,17 @@ def rough_classify(
             collected[thread_id][pass_.name] = getattr(result, pass_.attribute)
 
     rough: dict[int, RoughLabels] = {}
+    unclassified: list[int] = []
     for thread_id, fields in collected.items():
         if thread_id in failed or len(fields) != len(passes):
+            unclassified.append(thread_id)
             continue
         rough[thread_id] = RoughLabels(
             category=fields["category"],
             queue=fields["queue"],
             escalate=bool(fields["escalate"]),
         )
-    return rough, failures
+    return rough, failures, sorted(unclassified)
 
 
 def estimate_scan_cost(
@@ -391,6 +409,7 @@ def stratified_select(
     target_n: int = DEFAULT_TARGET_N,
     floor: int = DEFAULT_CLASS_FLOOR,
     seed: int = SELECT_SEED,
+    top_up_only: list[int] | None = None,
 ) -> tuple[list[int], dict[str, int], dict[str, int]]:
     """Select toward per-class floors, then top up to ``target_n``.
 
@@ -398,6 +417,9 @@ def stratified_select(
     short of its floor. Quotas are the hard constraint: a selection that
     satisfies them is never truncated back to ``target_n``, because truncating
     would break the support the floors exist to guarantee.
+
+    ``top_up_only`` ids carry no stratum, so they can be drawn during top-up but
+    never counted toward a quota.
     """
     quotas = quota_buckets(floor)
     members: dict[str, list[int]] = {bucket: [] for bucket in quotas}
@@ -417,8 +439,9 @@ def stratified_select(
     def take(thread_id: int) -> None:
         selected.append(thread_id)
         chosen.add(thread_id)
-        for bucket in rough[thread_id].buckets():
-            support[bucket] += 1
+        if thread_id in rough:
+            for bucket in rough[thread_id].buckets():
+                support[bucket] += 1
 
     ordering = list(quotas)
     while True:
@@ -439,7 +462,8 @@ def stratified_select(
         take(available[0])
 
     if len(selected) < target_n:
-        remaining = [tid for tid in sorted(rough) if tid not in chosen]
+        pool_ids = sorted(rough) + sorted(top_up_only or [])
+        remaining = [tid for tid in pool_ids if tid not in chosen]
         rng.shuffle(remaining)
         for thread_id in remaining[: target_n - len(selected)]:
             take(thread_id)
@@ -453,15 +477,34 @@ def stratified_select(
 # ---------------------------------------------------------------------------
 
 
+def assert_freezable(out_dir: Path | str, *, force: bool = False) -> None:
+    """Refuse to replace a pool that labeling has already started against."""
+    started = sorted(p.name for p in Path(out_dir).glob("pass_*.csv"))
+    if started and not force:
+        raise PoolError(
+            f"labeling has already started against the pool in {out_dir} "
+            f"({', '.join(started)}); re-freezing would orphan those answers. "
+            "Move them aside, or pass --force to discard the existing pool."
+        )
+
+
 def write_pool(
     out_dir: Path | str,
     selected: list[int],
     rough: dict[int, RoughLabels],
     stats: dict[str, Any],
+    force: bool = False,
 ) -> None:
-    """Freeze the pool: membership, rough labels, and stats in separate files."""
+    """Freeze the pool: membership, rough labels, and stats in separate files.
+
+    Refuses to replace a pool that labeling has already started against: the
+    pass files key answers by thread id, so a re-freeze would silently leave
+    them describing threads the new pool does not contain.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    assert_freezable(out_dir, force=force)
 
     with open(out_dir / POOL_FILE, "w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
@@ -472,7 +515,10 @@ def write_pool(
         writer = csv.writer(handle)
         writer.writerow(("thread_id", "category", "queue", "escalate"))
         for thread_id in selected:
-            labels = rough[thread_id]
+            labels = rough.get(thread_id)
+            if labels is None:
+                writer.writerow((thread_id, "", "", ""))
+                continue
             writer.writerow(
                 (thread_id, labels.category, labels.queue, str(labels.escalate).lower())
             )
@@ -560,8 +606,10 @@ def build_pool(
     exclude: set[int] | None = None,
     model: str | None = None,
     prep: ScanPrep | None = None,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Build and freeze the candidate pool; returns the stats record."""
+    assert_freezable(out_dir, force=force)
     model = model or config.get_model(config.ROLE_PIPELINE, config.DEV)
 
     if prep is None:
@@ -573,20 +621,26 @@ def build_pool(
         cache = CallCache(cache_path or Path(out_dir) / "pool_cache.db")
         client = CachingClient(cache, run_id="pool-scan")
 
-    rough, failures = rough_classify(survivors, model=model, client=client)
+    rough, failures, unclassified = rough_classify(
+        survivors, model=model, client=client
+    )
     rejected.update(failures)
 
     selected, support, shortfalls = stratified_select(
-        rough, target_n=target_n, floor=floor
+        rough, target_n=target_n, floor=floor, top_up_only=unclassified
     )
-    rejected[CRITERION_NOT_SELECTED] = len(rough) - len(selected)
+    rejected[CRITERION_NOT_SELECTED] = (
+        len(rough) + len(unclassified) - len(selected)
+    )
 
     stats = {
         "corpus_threads": prep.corpus_threads,
         "structurally_eligible": len(eligible),
         "scanned": len(scanned),
         "rough_classified": len(rough),
+        "rough_unclassified": len(unclassified),
         "selected": len(selected),
+        "selected_unclassified": sum(1 for tid in selected if tid not in rough),
         "class_floor": floor,
         "target_n": target_n,
         "rejections": dict(sorted(rejected.items())),
@@ -598,5 +652,5 @@ def build_pool(
     if hasattr(client, "usage_snapshot"):
         stats["usage"] = client.usage_snapshot()
 
-    write_pool(out_dir, selected, rough, stats)
+    write_pool(out_dir, selected, rough, stats, force=force)
     return stats
