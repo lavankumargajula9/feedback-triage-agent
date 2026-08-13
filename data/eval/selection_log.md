@@ -63,9 +63,55 @@ same wording.
 - **Threads are the unit, not tweets.** Reconstruction follows R31: root-to-leaf
   branch containing the requested tweet plus direct brand replies, truncation
   and cycles flagged, sibling replies from other customers excluded.
-- **PENDING — stratification.** Target: >=12 per class across queues and both
-  escalation outcomes, at N=80 (the cut-ladder floor). Record the achieved
-  per-class support and any top-up rounds here.
+- **Stratification.** Target: >=12 per class across queues and both escalation
+  outcomes, at N=80 (the cut-ladder floor). Built by `triage pool` (U6, KTD8) in
+  four stages, all seeded and reproducible from `pool_stats.json`'s manifest:
+
+  1. *Structural prefilter* — one grouped SQL scan over the full corpus,
+     class-neutral criteria only (a customer tweet exists; raw customer text is
+     at least `MIN_DIAGNOSABLE_WORDS` characters). The floor is derived so it
+     can only over-admit relative to `degenerate_reason`; SQL never becomes a
+     second definition of degeneracy.
+  2. *Seeded uniform sample* down to scan size. The volume cut is random, not a
+     content rule — nothing about a thread's wording changes its odds of being
+     scanned.
+  3. *Degeneracy screen* using `degenerate_reason` itself, rejections counted
+     per reason (see the table below when filled).
+  4. *Stratifier* (CONCEPTS.md sense): rough classification on the DEV profile
+     (`claude-haiku-4-5`, R30 — its spend is outside the measurement ceiling),
+     three isolated per-field passes so the rough queue guess is never anchored
+     on the rough category guess, then largest-deficit-first selection toward
+     the floors. Rough labels are written to `pool_rough.csv`, never to the
+     membership file the labeling path reads; the annotator cannot see a model
+     guess.
+
+  A thread whose rough classification fails after retries stays eligible with
+  no stratum (top-up only, counted toward no quota). Dropping it would make
+  admission depend on the model succeeding, and refusals correlate with
+  content — the second instance of the selection-bias family recorded in
+  `docs/solutions/tooling-decisions/stratifier-failure-drops-repeat-the-selection-bias.md`.
+
+  **Disclosed residual risks, both bounded (this is the disclosure-is-correct
+  case, not the disclosure-as-remedy error):**
+
+  - *Rare-class stratum legibility.* Candidates for a class's quota come from
+    threads the dev model itself predicted as that class. If the dev model has
+    a systematic blind spot — subtle unauthorized-access threads it fails to
+    read as Account Security — that stratum skews toward model-legible cases.
+    Probabilistic rather than categorical (unlike the rejected keyword rule,
+    every scanned thread is scored and misreads still enter the pool in another
+    stratum), but not zero, and inherent to any imperfect stratifier short of
+    labeling the whole corpus.
+  - *Resume nondeterminism.* The LLM cache stores successful parses only, so an
+    interrupted-and-resumed scan re-rolls previously failed calls and can reach
+    a slightly different classified/unclassified split than an uninterrupted
+    run. Seeds do not cover this. The realized failure counts below bound how
+    much this could matter.
+
+  **PENDING — achieved numbers** (filled from `pool_stats.json` when the scan
+  completes): funnel counts, per-criterion rejections including per-reason
+  degeneracy and per-pass rough failures, achieved support per bucket, any
+  shortfalls, and top-up rounds during labeling.
 
 ## 3. Labeling protocol — three independent passes
 
