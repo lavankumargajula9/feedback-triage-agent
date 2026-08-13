@@ -348,6 +348,14 @@ the same reason an answer you have merely hidden is still in the session.
 
 ## Related
 
+- [stratifier-failure-drops-repeat-the-selection-bias.md](stratifier-failure-drops-repeat-the-selection-bias.md)
+  — the second instance of this failure family, found in the shipped stratifier on
+  2026-08-13. The dev-model pass was chosen as this document recommends, and then dropped
+  every thread whose classification call failed after retries. Refusals and malformed
+  output correlate with abusive, non-English, and messy content, so admission again
+  correlated with difficulty — this time through error handling rather than vocabulary.
+  Evidence that stating the general rule, rather than the "use a model" conclusion, is what
+  made the second instance recognisable.
 - `data/eval/selection_log.md` — the operational record this rule governs. Section 2's
   stratification entry is still PENDING; it should state the dev-model rule when filled in.
 - `docs/plans/2026-08-11-001-feat-feedback-triage-agent-plan.md` — KTD8 (line 194) is the
