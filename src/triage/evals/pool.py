@@ -5,6 +5,9 @@ read back by ``triage label``. Stages: structural prefilter (SQL) -> seeded
 uniform sample -> degeneracy screen -> rough classification on the dev profile
 -> stratified selection toward per-class floors.
 
+The rough-classification pass is the **Stratifier** of ``CONCEPTS.md``: it only
+predicts, never labels.
+
 Two invariants the code cannot show:
 
 - The SQL character floor may only ever OVER-admit relative to
@@ -21,6 +24,7 @@ Why a model rough-classifies rather than a keyword rule:
 from __future__ import annotations
 
 import csv
+import io
 import json
 import random
 import sqlite3
@@ -33,7 +37,7 @@ from pydantic import BaseModel, Field
 
 from triage import config
 from triage.evals.cache import CachingClient, CallCache, call_cost
-from triage.ingest.store import get_thread
+from triage.ingest.store import IngestError, get_thread
 from triage.prompts import fragments
 from triage.tools.llm import call_with_schema
 from triage.tools.retrieval import MIN_DIAGNOSABLE_WORDS, clean_text, degenerate_reason
@@ -255,7 +259,10 @@ def screen_degenerate(
         if thread_id in exclude:
             rejected[CRITERION_EXCLUDED] += 1
             continue
-        thread = get_thread(conn, thread_id)
+        try:
+            thread = get_thread(conn, thread_id)
+        except IngestError as exc:
+            raise PoolError(f"cannot read thread {thread_id}: {exc}") from None
         reason = degenerate_reason(thread)
         if reason is not None:
             rejected[f"{CRITERION_DEGENERATE}:{_degenerate_slug(reason)}"] += 1
@@ -477,6 +484,20 @@ def stratified_select(
 # ---------------------------------------------------------------------------
 
 
+def _atomic_text(path: Path, text: str) -> None:
+    """Replace ``path`` in one step, so readers never see a partial file."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _atomic_csv(path: Path, rows) -> None:
+    """Write CSV rows through the same replace-in-one-step guarantee."""
+    buffer = io.StringIO()
+    csv.writer(buffer, lineterminator="\r\n").writerows(rows)
+    _atomic_text(path, buffer.getvalue())
+
+
 def assert_freezable(out_dir: Path | str, *, force: bool = False) -> None:
     """Refuse to replace a pool that labeling has already started against."""
     started = sorted(p.name for p in Path(out_dir).glob("pass_*.csv"))
@@ -506,26 +527,28 @@ def write_pool(
 
     assert_freezable(out_dir, force=force)
 
-    with open(out_dir / POOL_FILE, "w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(("thread_id",))
-        writer.writerows((thread_id,) for thread_id in selected)
-
-    with open(out_dir / ROUGH_FILE, "w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(("thread_id", "category", "queue", "escalate"))
-        for thread_id in selected:
-            labels = rough.get(thread_id)
-            if labels is None:
-                writer.writerow((thread_id, "", "", ""))
-                continue
-            writer.writerow(
-                (thread_id, labels.category, labels.queue, str(labels.escalate).lower())
+    rough_rows = [("thread_id", "category", "queue", "escalate")]
+    for thread_id in selected:
+        labels = rough.get(thread_id)
+        rough_rows.append(
+            (thread_id, "", "", "")
+            if labels is None
+            else (
+                thread_id,
+                labels.category,
+                labels.queue,
+                str(labels.escalate).lower(),
             )
+        )
 
-    (out_dir / STATS_FILE).write_text(
-        json.dumps(stats, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    # Membership lands last: read_pool gates on it, so its presence means the
+    # other two files are already complete. Each replace is atomic, so a crash
+    # can leave a stale pool but never a torn one.
+    _atomic_csv(out_dir / ROUGH_FILE, rough_rows)
+    _atomic_text(
+        out_dir / STATS_FILE, json.dumps(stats, indent=2, sort_keys=True) + "\n"
     )
+    _atomic_csv(out_dir / POOL_FILE, [("thread_id",), *((t,) for t in selected)])
 
 
 def read_pool(out_dir: Path | str) -> list[int]:

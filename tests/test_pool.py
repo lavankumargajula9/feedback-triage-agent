@@ -168,19 +168,22 @@ class TestStructuralPrefilter:
         assert pool.MIN_CUSTOMER_CHARS == MIN_DIAGNOSABLE_WORDS
 
     @pytest.mark.parametrize(
-        "texts",
+        ("texts", "accepted"),
         [
-            ["a", "b", "c"],
-            ["a", "b", "c", "d"],
-            ["ab", "c"],
-            ["a", "bc"],
-            ["app crashed", "today"],
+            (["a", "b", "c"], True),
+            (["a", "b", "c", "d"], True),
+            (["app crashed", "today"], True),
+            (["ab", "c"], False),
+            (["a", "bc"], False),
         ],
     )
-    def test_floor_admits_multi_tweet_threads_the_predicate_accepts(self, texts):
+    def test_floor_admits_multi_tweet_threads_the_predicate_accepts(
+        self, texts, accepted
+    ):
         thread = make_thread(texts, inbound_flags=[True] * len(texts))
-        raw_chars = sum(len(t.text) for t in thread.tweets if t.inbound)
-        if degenerate_reason(thread) is None:
+        assert (degenerate_reason(thread) is None) is accepted
+        if accepted:
+            raw_chars = sum(len(t.text) for t in thread.tweets if t.inbound)
             assert raw_chars >= pool.MIN_CUSTOMER_CHARS
 
 
@@ -218,6 +221,22 @@ class TestDegeneracyScreen:
         assert rejected[f"{pool.CRITERION_DEGENERATE}:dm_deflected"] == 1
         assert all(tid != deflected for tid, _ in survivors)
         assert len(survivors) == len(eligible) - 1
+
+    @pytest.mark.parametrize(
+        ("text", "slug"),
+        [
+            ("@brand https://x.co/1", "empty_after_cleaning"),
+            ("broken again", "below_word_minimum"),
+            ("I have sent you a DM just now", "dm_deflected"),
+        ],
+    )
+    def test_counts_each_degeneracy_reason_separately(self, store, text, slug):
+        thread_id = add_thread(store, root=9400, author="705", text=text)
+        _survivors, rejected = pool.screen_degenerate(store, [thread_id])
+        assert rejected[f"{pool.CRITERION_DEGENERATE}:{slug}"] == 1
+
+    def test_unrecognized_reason_falls_back_to_other(self):
+        assert pool._degenerate_slug("something new") == "other"
 
     def test_screen_agrees_with_the_predicate_on_every_thread(self, store):
         add_thread(store, root=9201, author="776", text="I have sent you a DM just now")
@@ -444,6 +463,25 @@ class TestFreezeAndRead:
             row = next(csv.DictReader(handle))
         assert row == {"thread_id": "7", "category": "", "queue": "", "escalate": ""}
 
+    def test_a_crash_mid_freeze_leaves_no_readable_pool(self, tmp_path, monkeypatch):
+        # read_pool gates on membership, so membership must land last: a torn
+        # freeze has to look absent, never valid-but-partial.
+        real = pool._atomic_text
+
+        def fail_on_stats(path, text):
+            if path.name == pool.STATS_FILE:
+                raise OSError("disk full")
+            return real(path, text)
+
+        monkeypatch.setattr(pool, "_atomic_text", fail_on_stats)
+        rough = {1: pool.RoughLabels("General Inquiry", "Tier-1 General", False)}
+        with pytest.raises(OSError):
+            pool.write_pool(tmp_path, [1], rough, {"selected": 1})
+
+        assert not (tmp_path / pool.POOL_FILE).exists()
+        with pytest.raises(pool.PoolError):
+            pool.read_pool(tmp_path)
+
     def test_missing_pool_raises_with_an_instructive_message(self, tmp_path):
         with pytest.raises(pool.PoolError, match="triage pool"):
             pool.read_pool(tmp_path)
@@ -532,6 +570,47 @@ class TestLabelCandidatesUsesTheFrozenPool:
         with pytest.raises(pool.PoolError, match="absent from this store"):
             cli._label_candidates(conn, tmp_path)
 
+    def test_limit_takes_the_shuffled_prefix_not_the_id_ordered_one(
+        self, db_path, tmp_path, monkeypatch
+    ):
+        from triage.evals import label_helper as lh
+
+        conn = open_store(db_path)
+        keep = [
+            tid
+            for tid in (r[0] for r in conn.execute("SELECT thread_id FROM threads"))
+            if degenerate_reason(get_thread(conn, tid)) is None
+        ]
+        assert len(keep) >= 3
+        rough = {
+            tid: pool.RoughLabels("General Inquiry", "Tier-1 General", False)
+            for tid in keep
+        }
+        pool.write_pool(tmp_path, keep, rough, {"selected": len(keep)})
+
+        monkeypatch.setattr("builtins.input", lambda *_: "1")
+        code = cli.main(
+            [
+                "label",
+                "--pass",
+                "category",
+                "--db",
+                str(db_path),
+                "--out",
+                str(tmp_path),
+                "--limit",
+                "2",
+            ]
+        )
+        assert code == cli.EXIT_OK
+
+        shuffled = lh.pass_order(lh.CATEGORY_PASS, keep)
+        # Without this the test cannot tell the two orderings apart.
+        assert shuffled[:2] != sorted(keep)[:2]
+
+        answered = list(lh.read_pass(lh.CATEGORY_PASS, tmp_path))
+        assert answered == shuffled[:2]
+
     def test_missing_pool_is_an_input_error(self, db_path, tmp_path, capsys):
         code = cli.main(
             ["label", "--pass", "category", "--db", str(db_path), "--out", str(tmp_path)]
@@ -572,6 +651,37 @@ class TestPoolCli:
         assert "claude-haiku-4-5" in out
         assert "passes" in out
         assert "retry = $" in out
+
+    def test_unmet_class_floor_freezes_the_pool_but_exits_nonzero(
+        self, db_path, tmp_path, capsys
+    ):
+        # CONCEPTS.md: sparsity is a result, reported with a non-zero exit,
+        # never quietly backfilled.
+        conn = open_store(db_path)
+        prep = pool.prepare_scan(conn, scan_size=100)
+        answers = {
+            text: rough_of("Technical/Product", "Technical Support", False)
+            for _tid, text in prep.survivors
+        }
+        monkey = RoughClient(answers)
+        code = cli.main(
+            [
+                "pool",
+                "--db",
+                str(db_path),
+                "--out",
+                str(tmp_path),
+                "--target-n",
+                "1",
+                "--floor",
+                "1",
+            ],
+            client=monkey,
+        )
+        out = capsys.readouterr().out
+        assert code == cli.EXIT_PIPELINE_FAILURE
+        assert "class floors NOT met" in out
+        assert pool.read_pool(tmp_path)
 
     def test_missing_store_is_an_input_error(self, tmp_path, capsys):
         code = cli.main(["pool", "--db", str(tmp_path / "nope.db")])

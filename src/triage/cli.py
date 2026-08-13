@@ -958,17 +958,21 @@ def _read_thread_ids(path: Path) -> set[int]:
     if not path.is_file():
         raise InputError(f"no such file: {path}")
     ids: set[int] = set()
-    with open(path, encoding="utf-8", newline="") as handle:
-        for row in csv.reader(handle):
-            if not row or not row[0].strip():
-                continue
-            field = row[0].strip()
-            if field == "thread_id":
-                continue
-            try:
-                ids.add(int(field))
-            except ValueError:
-                raise InputError(f"{path}: {field!r} is not a thread id") from None
+    try:
+        with open(path, encoding="utf-8", newline="") as handle:
+            rows = list(csv.reader(handle))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise InputError(f"cannot read {path}: {exc}") from None
+    for row in rows:
+        if not row or not row[0].strip():
+            continue
+        field = row[0].strip()
+        if field == "thread_id":
+            continue
+        try:
+            ids.add(int(field))
+        except ValueError:
+            raise InputError(f"{path}: {field!r} is not a thread id") from None
     if not ids:
         raise InputError(f"{path} contains no thread ids")
     return ids
@@ -1057,11 +1061,14 @@ def _cmd_pool(args: argparse.Namespace, *, client: Any = None) -> int:
             f"(rough pass failed; still eligible, no stratum)"
         )
     print(f"selected:         {stats['selected']} (target {stats['target_n']})")
+    print(f"frozen to {Path(out_dir) / pool_mod.POOL_FILE}")
     if stats["shortfalls"]:
-        print("class floors NOT met (recorded, not silently dropped):")
+        # A class that cannot reach its floor is a data-sparsity result, not a
+        # defect — but it must never exit clean (CONCEPTS.md, per-class floor).
+        print("\nclass floors NOT met — genuine data sparsity, not backfilled:")
         for bucket, achieved in sorted(stats["shortfalls"].items()):
             print(f"  {bucket}: {achieved}/{stats['class_floor']}")
-    print(f"frozen to {Path(out_dir) / pool_mod.POOL_FILE}")
+        return EXIT_PIPELINE_FAILURE
     return EXIT_OK
 
 
