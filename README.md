@@ -170,6 +170,45 @@ in-flight batch id is persisted and re-attached. Retry semantics and typed
 failure kinds match the sync path exactly; per-call latency is the one metric
 batch mode cannot record, so latency comparisons come from sync runs only.
 
+## Example: one thread end to end
+
+Real model output (dev profile, via the batch execution path) over one of the
+repo's hand-authored fixture threads — shown because the dataset's license
+bars committing real tweet text. This is an illustration of behavior, **not a
+measured result**: no gold label exists for this thread, so nobody gets to
+claim who is right below.
+
+Input thread:
+
+```
+[Tue Oct 31 22:00:00 +0000 2017] Customer: @sprintcare my data plan stopped working today
+[Tue Oct 31 22:05:00 +0000 2017] Support:  @100001 sorry to hear that! Can you DM us your account number?
+[Tue Oct 31 22:10:00 +0000 2017] Customer: @sprintcare just sent the DM
+[Tue Oct 31 22:15:00 +0000 2017] Support:  @100001 got it - we are looking into it now
+```
+
+Pipeline output (abridged rationales):
+
+```json
+{
+  "categorize": { "label": "Technical/Product",
+                  "rationale": "data plan stopped working - a service malfunction ..." },
+  "route":      { "queue": "Technical Support",
+                  "rationale": "requires diagnosis beyond front-line self-serve ..." },
+  "escalate":   { "escalate": false,
+                  "reason": "normal support flow, issue under investigation ..." },
+  "draft":      { "draft": "Thanks for your patience! We've received your account
+                  details and our technical team is actively investigating ...",
+                  "status": "never_sent" }
+}
+```
+
+The single-prompt baseline, on the same thread at the same information, agrees
+on category and queue — and **disagrees on escalation** (baseline says
+`escalate: true`). That disagreement is precisely what the eval set exists to
+adjudicate: without a human gold label, neither answer gets to be called
+correct, which is why the Results section stays empty until labels exist.
+
 ## Data and licensing
 
 Source: [Customer Support on Twitter](https://www.kaggle.com/datasets/thoughtvector/customer-support-on-twitter)
