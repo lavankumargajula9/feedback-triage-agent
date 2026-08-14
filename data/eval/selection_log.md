@@ -185,6 +185,19 @@ is used only to stratify the candidate pool (KTD8); displaying its guess would
 be the strongest available anchor and would reduce the eval to measuring the
 model's agreement with itself.
 
+### Pass-1 redo (2026-08-14)
+
+The first category sweep was discarded and redone in full. A post-pass check
+found its distribution collapsed into the two catch-all labels (41 General
+Inquiry + 23 Complaint/Dispute of 80, zero Account/Access) with at least one
+confirmed slip, a pattern consistent with mood-based labeling and menu
+mistypes rather than topic judgments. The redo followed
+`labeling_cheatsheet.md` (definitions copied verbatim from the single-sourced
+`fragments.py`). The discarded sweep is kept at `pass_category.attempt1.csv`;
+no per-thread disagreement list was shown to the annotator — the check used
+only aggregate counts plus one thread already discussed in the open, so the
+redo stays anchored to definitions, not to model guesses.
+
 ### Pass order seeds
 
 Each pass shuffles under its own fixed seed, so by the second sweep threads
