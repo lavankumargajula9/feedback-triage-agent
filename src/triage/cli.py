@@ -365,6 +365,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "way a reference is ever recorded (KTD10)"
         ),
     )
+    evaluate.add_argument(
+        "--batch",
+        action="store_true",
+        help=(
+            "execute through the Messages Batch API at 50%% of list price; "
+            "per-call latency is not recorded in this mode"
+        ),
+    )
     return parser
 
 
@@ -700,8 +708,20 @@ def _score_drafts(
     threads: dict[int, str],
 ) -> dict[str, Any]:
     """Judge both arms' drafts for one complete run (R13, R32, KTD5)."""
-    from triage.evals.judge import score_run
+    from triage.evals.judge import score_run, score_run_batch
 
+    if getattr(args, "batch", False):
+        return score_run_batch(
+            results,
+            labels,
+            model=options["judge_model"],
+            anchors=options["anchors"],
+            out_dir=out_dir,
+            cache_path=args.cache,
+            batch_client=client,
+            threads=threads,
+            run_id=results.get("run_id", ""),
+        )
     return score_run(
         results,
         labels,
@@ -786,6 +806,7 @@ def _cmd_eval(args: argparse.Namespace, client: Any = None) -> int:
         load_gold_labels,
         resume_instruction,
         run_eval,
+        run_eval_batch,
         write_results,
     )
 
@@ -822,6 +843,7 @@ def _cmd_eval(args: argparse.Namespace, client: Any = None) -> int:
             profile=args.profile,
             run_id=args.run_id,
             judge=options["plan"],
+            batch=args.batch,
         )
     )
     if args.dry_run:
@@ -829,15 +851,26 @@ def _cmd_eval(args: argparse.Namespace, client: Any = None) -> int:
         return EXIT_OK
 
     try:
-        run_eval(
-            threads,
-            out_dir=out_dir,
-            cache_path=args.cache,
-            pipeline_model=pipeline_model,
-            baseline_model=baseline_model,
-            run_id=args.run_id,
-            client=client,
-        )
+        if args.batch:
+            run_eval_batch(
+                threads,
+                out_dir=out_dir,
+                cache_path=args.cache,
+                pipeline_model=pipeline_model,
+                baseline_model=baseline_model,
+                run_id=args.run_id,
+                batch_client=client,
+            )
+        else:
+            run_eval(
+                threads,
+                out_dir=out_dir,
+                cache_path=args.cache,
+                pipeline_model=pipeline_model,
+                baseline_model=baseline_model,
+                run_id=args.run_id,
+                client=client,
+            )
     # Deliberately broad, and KeyboardInterrupt is not an Exception: ANY mid-run
     # stop must yield the resume instruction rather than a bare stack trace (R32).
     except (KeyboardInterrupt, Exception) as exc:  # noqa: BLE001

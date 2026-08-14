@@ -173,6 +173,39 @@ class _CachedMessage:
     stop_reason: str = "cached"
 
 
+def request_identity(kwargs: Mapping[str, Any], run_id: str) -> tuple[str, str, Any, str]:
+    """(key, model, schema, schema_name) for one messages.parse request.
+
+    The single key derivation every cache-aware client uses (KTD5): the sync
+    caching client and the batch collector must agree byte-for-byte or a batch
+    result could never be replayed by a later sync run.
+    """
+    schema = kwargs["output_format"]
+    schema_name = f"{schema.__module__}.{schema.__qualname__}"
+    model = kwargs["model"]
+    params = {
+        k: v
+        for k, v in kwargs.items()
+        if k not in ("model", "system", "messages", "output_format")
+    }
+    key = cache_key(
+        model=model,
+        system=kwargs.get("system", ""),
+        user_text=json.dumps(kwargs["messages"], sort_keys=True, ensure_ascii=False),
+        schema_name=schema_name,
+        schema_digest=schema_digest(schema),
+        params=params,
+        run_id=run_id,
+    )
+    return key, model, schema, schema_name
+
+
+def replay_message(payload: str, schema: Any) -> _CachedMessage:
+    """A stored payload as a message; raises ValidationError when the schema
+    no longer accepts it."""
+    return _CachedMessage(parsed_output=schema.model_validate_json(payload))
+
+
 class _CachingMessages:
     """The ``client.messages`` facade: cache lookup, then the real client."""
 
@@ -188,23 +221,7 @@ class _CachingMessages:
         return dict(self.usage)
 
     def parse(self, **kwargs: Any) -> Any:
-        schema = kwargs["output_format"]
-        schema_name = f"{schema.__module__}.{schema.__qualname__}"
-        model = kwargs["model"]
-        params = {
-            k: v
-            for k, v in kwargs.items()
-            if k not in ("model", "system", "messages", "output_format")
-        }
-        key = cache_key(
-            model=model,
-            system=kwargs.get("system", ""),
-            user_text=json.dumps(kwargs["messages"], sort_keys=True, ensure_ascii=False),
-            schema_name=schema_name,
-            schema_digest=schema_digest(schema),
-            params=params,
-            run_id=self._run_id,
-        )
+        key, model, schema, schema_name = request_identity(kwargs, self._run_id)
         payload = self._cache.get(key)
         if payload is not None:
             replayed = self._replay(key, payload, schema)
@@ -242,7 +259,7 @@ class _CachingMessages:
         scored as a model failure (R27) on every retry.
         """
         try:
-            return _CachedMessage(parsed_output=schema.model_validate_json(payload))
+            return replay_message(payload, schema)
         except ValidationError:
             self._cache.delete(key)
             return None

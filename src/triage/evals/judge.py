@@ -40,6 +40,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from triage.evals.batch import (
+    DEFAULT_POLL_SECONDS,
+    BatchError,
+    PendingBatchCall,
+    drive_waves,
+)
 from triage.evals.cache import CachingClient, CallCache, call_cost
 from triage.evals.runner import (
     EvalError,
@@ -540,6 +546,99 @@ def score_run(
                 },
             )
             per_system[system][tid] = record
+    finally:
+        cache.close()
+    return {
+        "model": model,
+        "n_threads": len(results["threads"]),
+        "systems": {system: _summarize(records) for system, records in per_system.items()},
+    }
+
+
+def score_run_batch(
+    results: Mapping[str, Any],
+    gold: Mapping[int, GoldLabel],
+    *,
+    model: str,
+    anchors: Sequence[AnchorExample],
+    out_dir: Path | str,
+    cache_path: Path | str,
+    batch_client: Any = None,
+    threads: Mapping[int, str] | None = None,
+    run_id: str = "",
+    poll_seconds: float = DEFAULT_POLL_SECONDS,
+) -> dict[str, Any]:
+    """score_run through the Messages Batch API at 50% of list price (R13, KTD5).
+
+    Judge calls are independent per (thread, arm), so the whole set lands in
+    one wave plus any R27 retry waves; checkpoints, identity guards, and the
+    report shape are identical to :func:`score_run`.
+    """
+    threads = threads or {}
+    out_dir = Path(out_dir)
+    judge_checkpoint_dir(out_dir).mkdir(parents=True, exist_ok=True)
+    identity = judge_identity(model=model, anchors=anchors, run_id=run_id)
+    items = [
+        (system, entry["thread_id"], extract(entry))
+        for entry in results["threads"]
+        for system, extract in _DRAFT_EXTRACTORS.items()
+    ]
+    _refuse_mismatched_checkpoints(out_dir, items, identity)
+    per_system: dict[str, dict[int, dict[str, Any]]] = {system: {} for system in _DRAFT_EXTRACTORS}
+    cache = CallCache(cache_path)
+
+    def client_factory() -> Any:
+        if batch_client is not None:
+            return batch_client
+        from triage.tools.llm import make_client
+
+        return make_client()
+
+    def pass_fn(collector: Any) -> bool:
+        all_done = True
+        for system, tid, draft in items:
+            if tid in per_system[system]:
+                continue
+            path = judge_checkpoint_path(out_dir, system, tid)
+            if path.is_file():
+                per_system[system][tid] = load_checkpoint(path)["record"]
+                continue
+            collector.owner = (tid, system)
+            try:
+                record = _judge_record(
+                    draft,
+                    gold[tid],
+                    model=model,
+                    anchors=anchors,
+                    thread_text=threads.get(tid),
+                    client=collector,
+                )
+            except PendingBatchCall:
+                all_done = False
+                continue
+            write_json_atomic(
+                path,
+                {
+                    "thread_id": tid,
+                    "system": system,
+                    "identity": identity,
+                    "draft_fingerprint": draft_fingerprint(draft),
+                    "record": record,
+                },
+            )
+            per_system[system][tid] = record
+        return all_done
+
+    try:
+        drive_waves(
+            pass_fn,
+            cache=cache,
+            run_id=run_id,
+            batch_client_factory=client_factory,
+            poll_seconds=poll_seconds,
+        )
+    except BatchError as exc:
+        raise EvalError(f"batch judge scoring failed: {exc}") from None
     finally:
         cache.close()
     return {

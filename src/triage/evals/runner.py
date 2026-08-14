@@ -34,6 +34,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from triage.evals.batch import (
+    BATCH_DISCOUNT,
+    DEFAULT_POLL_SECONDS,
+    BatchError,
+    PendingBatchCall,
+    drive_waves,
+)
 from triage.evals.cache import CachingClient, CallCache, call_cost, usage_delta
 from triage.ingest.reconstruct import Thread
 from triage.pipeline import result_dict, run_pipeline
@@ -235,18 +242,22 @@ def format_preview(
     profile: str,
     run_id: str = "",
     judge: Mapping[str, Any] | None = None,
+    batch: bool = False,
 ) -> str:
     """The planned-call-count and rough-cost preview printed BEFORE executing (R32).
 
     ``judge`` is :func:`triage.evals.judge.judge_plan` when judging is enabled:
     judge calls cost several times a pipeline step, and the operator decides to
     spend on this number, so they are counted and priced here or not at all.
+    ``batch`` prices every call at the Batch API's 50% of list price.
     """
+    factor = BATCH_DISCOUNT if batch else 1.0
     arms_cost = _arms_cost(
         remaining * PIPELINE_CALLS_PER_THREAD,
         pipeline_model,
         remaining * BASELINE_CALLS_PER_THREAD,
         baseline_model,
+        factor,
     )
     lines = [
         (
@@ -267,10 +278,16 @@ def format_preview(
             pipeline_model,
             remaining * BASELINE_CALLS_PER_THREAD,
             baseline_model,
+            factor,
         ),
     ]
+    if batch:
+        lines.append(
+            "Batch API mode: costs above are at 50% of list price; "
+            "per-call latency is not recorded"
+        )
     if judge is not None:
-        lines.extend(_judge_preview_lines(remaining, judge, arms_cost))
+        lines.extend(_judge_preview_lines(remaining, judge, arms_cost, factor))
     if run_id:
         lines.append(
             f"Run-id salt {run_id!r}: prior cache entries are bypassed for this run (KTD5)."
@@ -279,18 +296,22 @@ def format_preview(
 
 
 def _arms_cost(
-    pipeline_calls: int, pipeline_model: str, baseline_calls: int, baseline_model: str
+    pipeline_calls: int,
+    pipeline_model: str,
+    baseline_calls: int,
+    baseline_model: str,
+    factor: float = 1.0,
 ) -> float | None:
     """Rough dollars for both arms, or None when either model has no price."""
     pipeline_cost = cost_per_call(pipeline_model)
     baseline_cost = cost_per_call(baseline_model)
     if pipeline_cost is None or baseline_cost is None:
         return None
-    return pipeline_calls * pipeline_cost + baseline_calls * baseline_cost
+    return (pipeline_calls * pipeline_cost + baseline_calls * baseline_cost) * factor
 
 
 def _judge_preview_lines(
-    remaining: int, judge: Mapping[str, Any], arms_cost: float | None
+    remaining: int, judge: Mapping[str, Any], arms_cost: float | None, factor: float = 1.0
 ) -> list[str]:
     """The judge's share of the preview, priced separately then totaled (R13)."""
     calls = remaining * judge["calls_per_thread"]
@@ -305,6 +326,7 @@ def _judge_preview_lines(
     if cost_per_judge_call is None:
         lines.append(f"Rough judge cost: unknown (no pricing on file for {judge['model']!r})")
         return lines
+    cost_per_judge_call *= factor
     judge_cost = calls * cost_per_judge_call
     lines.append(
         f"Rough judge cost: {calls} calls x ~${cost_per_judge_call:.4f} "
@@ -317,13 +339,19 @@ def _judge_preview_lines(
 
 
 def _cost_line(
-    pipeline_calls: int, pipeline_model: str, baseline_calls: int, baseline_model: str
+    pipeline_calls: int,
+    pipeline_model: str,
+    baseline_calls: int,
+    baseline_model: str,
+    factor: float = 1.0,
 ) -> str:
     pipeline_cost = cost_per_call(pipeline_model)
     baseline_cost = cost_per_call(baseline_model)
     if pipeline_cost is None or baseline_cost is None:
         unknown = pipeline_model if pipeline_cost is None else baseline_model
         return f"Rough cost: unknown (no pricing on file for {unknown!r})"
+    pipeline_cost *= factor
+    baseline_cost *= factor
     total = pipeline_calls * pipeline_cost + baseline_calls * baseline_cost
     return (
         f"Rough cost: {pipeline_calls} pipeline calls x ~${pipeline_cost:.4f} + "
@@ -538,6 +566,99 @@ def run_eval(
             }
             write_json_atomic(checkpoint_path(out_dir, thread_id), entry)
             done.add(thread_id)
+    finally:
+        cache.close()
+    return {"completed": len(done & set(threads)), "total": len(threads)}
+
+
+def run_eval_batch(
+    threads: dict[int, Thread],
+    *,
+    out_dir: Path | str,
+    cache_path: Path | str,
+    pipeline_model: str,
+    baseline_model: str,
+    run_id: str = "",
+    batch_client: Any = None,
+    poll_seconds: float = DEFAULT_POLL_SECONDS,
+) -> dict[str, int]:
+    """run_eval through the Messages Batch API at 50% of list price (KTD5, R32).
+
+    Same checkpoints, identity guards, and resume semantics as :func:`run_eval`;
+    execution is wave-based (see :mod:`triage.evals.batch`). Per-thread usage
+    is attributed from batch results with the discount applied; latency is
+    recorded as zero because a batch has no per-call latency to measure —
+    latency comparisons come from sync runs only.
+    """
+    out_dir = Path(out_dir)
+    checkpoint_dir(out_dir).mkdir(parents=True, exist_ok=True)
+    done = completed_thread_ids(out_dir)
+    identity = run_identity(
+        pipeline_model=pipeline_model, baseline_model=baseline_model, run_id=run_id
+    )
+    fingerprints = {tid: thread_fingerprint(thread) for tid, thread in threads.items()}
+    _check_checkpoint_identity(out_dir, sorted(done), identity, fingerprints)
+    cache = CallCache(cache_path)
+
+    def client_factory() -> Any:
+        if batch_client is not None:
+            return batch_client
+        from triage.tools.llm import make_client
+
+        return make_client()
+
+    def pass_fn(collector: Any) -> bool:
+        all_done = True
+        for thread_id in sorted(threads):
+            if thread_id in done:
+                continue
+            thread = threads[thread_id]
+            pending = False
+            collector.owner = (thread_id, "pipeline")
+            try:
+                pipeline_result = result_dict(
+                    run_pipeline(thread, model=pipeline_model, client=collector)
+                )
+            except PendingBatchCall:
+                pending = True
+            collector.owner = (thread_id, "baseline")
+            try:
+                baseline = _baseline_payload(
+                    run_baseline(thread, model=baseline_model, client=collector)
+                )
+            except PendingBatchCall:
+                pending = True
+            if pending:
+                all_done = False
+                continue
+            entry = {
+                "thread_id": thread_id,
+                "run_id": run_id,
+                "identity": identity,
+                "thread_fingerprint": fingerprints[thread_id],
+                "pipeline": pipeline_result,
+                "baseline": baseline,
+                "usage": {
+                    "pipeline": collector.ledger.spent_for((thread_id, "pipeline")),
+                    "baseline": collector.ledger.spent_for((thread_id, "baseline")),
+                },
+                "execution": "batch",
+                "ok": pipeline_result["ok"] and "failure" not in baseline,
+            }
+            write_json_atomic(checkpoint_path(out_dir, thread_id), entry)
+            done.add(thread_id)
+        return all_done
+
+    try:
+        drive_waves(
+            pass_fn,
+            cache=cache,
+            run_id=run_id,
+            batch_client_factory=client_factory,
+            poll_seconds=poll_seconds,
+        )
+    except BatchError as exc:
+        raise EvalError(f"batch eval failed: {exc}; {resume_instruction(out_dir)}") from None
     finally:
         cache.close()
     return {"completed": len(done & set(threads)), "total": len(threads)}
