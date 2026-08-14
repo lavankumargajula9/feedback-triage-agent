@@ -108,10 +108,53 @@ same wording.
     run. Seeds do not cover this. The realized failure counts below bound how
     much this could matter.
 
-  **PENDING — achieved numbers** (filled from `pool_stats.json` when the scan
-  completes): funnel counts, per-criterion rejections including per-reason
-  degeneracy and per-pass rough failures, achieved support per bucket, any
-  shortfalls, and top-up rounds during labeling.
+  **Achieved numbers** (from `pool_stats.json`, scan frozen 2026-08-14;
+  rough passes on `claude-haiku-4-5`, the dev profile per R30):
+
+  | Funnel stage | Threads |
+  |---|---:|
+  | Corpus | 901,648 |
+  | Structurally eligible | 901,560 |
+  | Seeded uniform sample | 4,000 |
+  | Survived degeneracy screen | 3,944 |
+  | Rough-classified | 3,944 |
+  | Selected (target 80) | **80** |
+
+  Per-criterion rejections: 87 `no_customer_tweet`, 1
+  `customer_text_below_floor` (structural prefilter); 53
+  `degenerate:below_word_minimum`, 3 `degenerate:empty_after_cleaning`
+  (degeneracy screen); 897,560 `not_sampled` (the seeded volume cut); 3,864
+  `not_selected_by_stratification`.
+
+  **Rough-classification failures after retries: 0** — no thread entered the
+  no-stratum top-up path, and the resume-nondeterminism risk above is bounded
+  at zero realized failures. (The scan was interrupted twice — a process
+  death on 2026-08-13 and API-credit exhaustion on 2026-08-14 — and resumed
+  from the call cache both times.)
+
+  Achieved support per bucket (floor >= 12), no shortfalls:
+
+  | Bucket | Support |
+  |---|---:|
+  | category: Account/Access | 13 |
+  | category: Billing/Payments | 12 |
+  | category: Complaint/Dispute | 16 |
+  | category: General Inquiry | 12 |
+  | category: Shipping/Delivery | 12 |
+  | category: Technical/Product | 15 |
+  | queue: Account Security | 12 |
+  | queue: Billing Ops | 13 |
+  | queue: Logistics | 16 |
+  | queue: Technical Support | 14 |
+  | queue: Tier-1 General | 13 |
+  | queue: Trust & Safety | 12 |
+  | escalate: true | 64 |
+  | escalate: false | 16 |
+
+  The escalation skew (64/16) is the dev model's rough guess over
+  quota-driven picks, not a claim about the corpus; the gold labels decide.
+  Top-up rounds during labeling: none yet — recorded here if labeling
+  triggers any.
 
 ## 3. Labeling protocol — three independent passes
 

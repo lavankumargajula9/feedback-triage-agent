@@ -1,0 +1,58 @@
+{
+  "class_floor": 12,
+  "corpus_threads": 901648,
+  "manifest": {
+    "min_customer_chars": 3,
+    "opening_char_limit": 600,
+    "profile": "dev",
+    "rough_passes": [
+      "category",
+      "queue",
+      "escalate"
+    ],
+    "scan_seed": 90218837,
+    "select_seed": 5512099
+  },
+  "model": "claude-haiku-4-5",
+  "rejections": {
+    "customer_text_below_floor": 1,
+    "degenerate:below_word_minimum": 53,
+    "degenerate:empty_after_cleaning": 3,
+    "no_customer_tweet": 87,
+    "not_sampled": 897560,
+    "not_selected_by_stratification": 3864
+  },
+  "rough_classified": 3944,
+  "rough_unclassified": 0,
+  "scanned": 4000,
+  "selected": 80,
+  "selected_unclassified": 0,
+  "shortfalls": {},
+  "structurally_eligible": 901560,
+  "support": {
+    "category:Account/Access": 13,
+    "category:Billing/Payments": 12,
+    "category:Complaint/Dispute": 16,
+    "category:General Inquiry": 12,
+    "category:Shipping/Delivery": 12,
+    "category:Technical/Product": 15,
+    "escalate:false": 16,
+    "escalate:true": 64,
+    "queue:Account Security": 12,
+    "queue:Billing Ops": 13,
+    "queue:Logistics": 16,
+    "queue:Technical Support": 14,
+    "queue:Tier-1 General": 13,
+    "queue:Trust & Safety": 12
+  },
+  "target_n": 80,
+  "usage": {
+    "cached_calls": 11145,
+    "calls": 11832,
+    "cost": 0.21124599999999985,
+    "latency_s": 657.9577802991262,
+    "tokens_in": 180331,
+    "tokens_out": 6183,
+    "unpriced_calls": 0
+  }
+}
