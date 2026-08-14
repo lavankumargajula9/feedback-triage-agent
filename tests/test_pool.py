@@ -505,7 +505,7 @@ class TestCostEstimate:
         assert estimate["cost"] == pytest.approx(0.075 * 1.10)
 
     def test_unpriced_model_reports_none_rather_than_free(self):
-        estimate = pool.estimate_scan_cost(10, model="claude-sonnet-5")
+        estimate = pool.estimate_scan_cost(10, model="model-with-no-price-entry")
         assert estimate["cost"] is None
 
 

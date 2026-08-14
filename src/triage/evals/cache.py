@@ -47,6 +47,8 @@ PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-opus-5": (5.0, 25.0),
     "claude-fable-5": (10.0, 50.0),
     "claude-haiku-4-5": (1.0, 5.0),
+    # Intro price until 2026-08-31; (3.0, 15.0) after.
+    "claude-sonnet-5": (2.0, 10.0),
 }
 
 # Per-call tally fields; ``unpriced_calls`` keeps a model with no price on file

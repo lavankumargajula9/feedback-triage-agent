@@ -66,9 +66,9 @@ PROFILES: dict[str, ModelRoles] = {
     # Measurement: models whose outputs are reported. Judge is deliberately a
     # different model from the draft models it grades (R22).
     MEASUREMENT: ModelRoles(
-        pipeline="claude-opus-5",
-        baseline="claude-opus-5",
-        judge="claude-fable-5",
+        pipeline="claude-sonnet-5",
+        baseline="claude-sonnet-5",
+        judge="claude-opus-5",
     ),
 }
 

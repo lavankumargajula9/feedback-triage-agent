@@ -24,13 +24,13 @@ from triage.config import (
 
 class TestHappyPath:
     def test_measurement_pipeline_model(self):
-        assert get_model(ROLE_PIPELINE, MEASUREMENT) == "claude-opus-5"
+        assert get_model(ROLE_PIPELINE, MEASUREMENT) == "claude-sonnet-5"
 
     def test_measurement_baseline_model(self):
-        assert get_model(ROLE_BASELINE, MEASUREMENT) == "claude-opus-5"
+        assert get_model(ROLE_BASELINE, MEASUREMENT) == "claude-sonnet-5"
 
     def test_measurement_judge_model(self):
-        assert get_model(ROLE_JUDGE, MEASUREMENT) == "claude-fable-5"
+        assert get_model(ROLE_JUDGE, MEASUREMENT) == "claude-opus-5"
 
     def test_dev_profile_uses_cheap_model_for_all_roles(self):
         for role in (ROLE_PIPELINE, ROLE_BASELINE, ROLE_JUDGE):
