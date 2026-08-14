@@ -29,13 +29,13 @@ one until it does.**
 |---|---|
 | Ingestion + thread reconstruction | Working — 2,811,774 tweets → 901,648 threads, 108 brands |
 | Tool layer (categorize / route / draft / escalate) | Working — schema-enforced, typed failures |
-| LangGraph pipeline + CLI | Working |
+| LangGraph pipeline + CLI | Working — pilot-verified over real threads (15/15 clean) |
 | MCP server | Working — structural parity tests against the same tool functions |
-| Eval harness (cache, runner, metrics, judge, regression) | Built and tested, nothing measured through it yet |
-| Candidate pool for the eval set | Building |
-| Gold labels | Not started — blocked on the pool |
-| Measured baseline-vs-pipeline results | **Not produced** |
-| Terminal recording (R19) | Not recorded |
+| Eval harness (cache, runner, metrics, judge, regression) | Built and tested; batch mode smoke-verified against the live Batch API |
+| Candidate pool for the eval set | **Frozen** — 80 threads, every category/queue bucket ≥ 12, zero shortfalls ([selection log](data/eval/selection_log.md)) |
+| Gold labels | In progress — hand-labeling underway, three isolated passes |
+| Measured baseline-vs-pipeline results | **Not produced** — runs the moment labels freeze |
+| Terminal recording (R19) | Cut, per the plan's agreed cut ladder (first item cut; the eval core is never cut) |
 
 The eval harness is complete *before* any results exist, which is deliberate:
 the agreement protocol, tolerances, and metric set are frozen in code so they
@@ -118,6 +118,15 @@ for recorded runs only.
 `triage eval --dry-run` prints the planned call count and cost estimate and
 executes nothing. `triage pool --dry-run` does the same for pool construction.
 
+`triage eval --batch` executes through the Messages Batch API at 50% of list
+price: threads run against a collecting client that replays the shared call
+cache and records misses, each wave submits the misses as one batch and
+validates results back into the same cache, so dependent pipeline steps become
+successive waves and an interrupted run resumes without re-paying — the
+in-flight batch id is persisted and re-attached. Retry semantics and typed
+failure kinds match the sync path exactly; per-call latency is the one metric
+batch mode cannot record, so latency comparisons come from sync runs only.
+
 ## Data and licensing
 
 Source: [Customer Support on Twitter](https://www.kaggle.com/datasets/thoughtvector/customer-support-on-twitter)
@@ -171,9 +180,17 @@ Project vocabulary is defined in [`CONCEPTS.md`](CONCEPTS.md).
 
 Not yet measured. This section will carry the baseline-vs-pipeline comparison —
 per-class precision/recall, confusion matrix, paired bootstrap confidence
-intervals, draft-quality scores with judge-human agreement, and per-arm cost and
-latency — once the reference run is recorded, with every number traceable to the
+intervals, draft-quality scores with judge-human agreement, and per-arm cost —
+once the reference run is recorded, with every number traceable to the
 committed run artifact.
+
+Everything upstream of the numbers is already frozen: the 80-thread pool, its
+[selection log](data/eval/selection_log.md) with achieved stratification
+counts, the [labeling protocol](data/eval/labeling_cheatsheet.md), and the
+measurement harness (smoke-verified end to end against the live Batch API).
+The remaining input is the hand-labeling itself, which is deliberately slow:
+the labels are the answer key, and this repo would rather show an empty
+results table than an unreliable one.
 
 ## Limitations
 

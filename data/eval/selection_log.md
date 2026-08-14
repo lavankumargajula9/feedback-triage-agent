@@ -198,6 +198,13 @@ no per-thread disagreement list was shown to the annotator — the check used
 only aggregate counts plus one thread already discussed in the open, so the
 redo stays anchored to definitions, not to model guesses.
 
+A second start (`pass_category.attempt2.csv`, 10 threads) was also set aside:
+its labels agreed with the annotator's own first-attempt labels on only 2 of
+the 10 shared threads, a test-retest instability that fails the reliability
+bar regardless of any model comparison. Labeling resumes fresh when it can be
+given unhurried attention; both discarded files stay in the repo as the
+honest record.
+
 ### Pass order seeds
 
 Each pass shuffles under its own fixed seed, so by the second sweep threads
