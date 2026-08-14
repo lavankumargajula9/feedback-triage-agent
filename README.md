@@ -20,6 +20,49 @@ traffic is messy: fragmented threads, vague complaints, mixed intents. Deciding
 is exactly the work a single prompt handles poorly and a measured multi-step
 system can be shown to handle better — if you actually measure it.
 
+## What this demonstrates
+
+Every claim below links to the artifact that proves it — nothing here asks to
+be taken on faith.
+
+- **Multi-step LLM orchestration.** A four-step LangGraph pipeline
+  ([`src/triage/pipeline/`](src/triage/pipeline/)) built over a
+  framework-free tool layer ([`src/triage/tools/`](src/triage/tools/)) of pure,
+  explicitly-parameterized functions — so the pipeline, the CLI, and the MCP
+  server are thin adapters over one implementation, and the baseline comparison
+  is at equal information by construction
+  ([`src/triage/prompts/fragments.py`](src/triage/prompts/fragments.py)).
+- **Protocol-level tool exposure (MCP).** A seven-tool stdio server
+  ([`src/triage/mcp_server.py`](src/triage/mcp_server.py)) whose parity tests
+  assert each MCP tool and its pipeline node reference the *identical
+  function object* ([`tests/test_mcp_parity.py`](tests/test_mcp_parity.py)) —
+  parity by identity, not by convention.
+- **Evaluation methodology under adversarial self-scrutiny.** A stratified
+  eval pool built by a four-stage, fully seeded funnel with its achieved
+  numbers frozen in a [selection log](data/eval/selection_log.md); a
+  three-pass labeling protocol whose anti-anchoring isolation is enforced
+  structurally and tested by instrumenting file access
+  ([`tests/test_label_helper.py`](tests/test_label_helper.py)); a judge
+  protocol and agreement statistics frozen in code *before* any result exists
+  ([`src/triage/evals/judge.py`](src/triage/evals/judge.py)); and a regression
+  gate that refuses to run vacuously
+  ([`src/triage/evals/regression.py`](src/triage/evals/regression.py)).
+- **Cost-aware infrastructure.** A cache-first, checkpointed eval runner with
+  a wave protocol over the Messages Batch API at 50% of list price —
+  interrupt-safe down to persisting the in-flight batch id, with typed failure
+  semantics identical to the sync path
+  ([`src/triage/evals/batch.py`](src/triage/evals/batch.py)) — and a pre-spend
+  cost preview printed before any command spends a cent.
+- **Data engineering on messy real input.** 2,811,774 raw tweets reconstructed
+  into 901,648 threads with truncation and cycle guards, and an ingest that
+  refuses — rather than silently re-keys — when a late-arriving parent would
+  change a labeled thread's identity ([`src/triage/ingest/`](src/triage/ingest/)).
+- **Engineering discipline.** 387 tests, all fully mocked (zero network in
+  CI), typed failures that are recorded rather than raised, resume paths on
+  every long-running operation, and a commit history showing review-driven
+  hardening — including the bugs the mocked suite could not catch, found by
+  adversarial review before the live API could.
+
 ## Status
 
 **In progress. No measured comparison exists yet, and this README will not carry
@@ -33,7 +76,7 @@ one until it does.**
 | MCP server | Working — structural parity tests against the same tool functions |
 | Eval harness (cache, runner, metrics, judge, regression) | Built and tested; batch mode smoke-verified against the live Batch API |
 | Candidate pool for the eval set | **Frozen** — 80 threads, every category/queue bucket ≥ 12, zero shortfalls ([selection log](data/eval/selection_log.md)) |
-| Gold labels | In progress — hand-labeling underway, three isolated passes |
+| Gold labels | Not yet produced — two calibration attempts were made and discarded for reliability, and are archived in-repo with the reasoning ([selection log](data/eval/selection_log.md)) |
 | Measured baseline-vs-pipeline results | **Not produced** — runs the moment labels freeze |
 | Terminal recording (R19) | Cut, per the plan's agreed cut ladder (first item cut; the eval core is never cut) |
 
