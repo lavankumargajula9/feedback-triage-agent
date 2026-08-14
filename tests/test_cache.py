@@ -18,6 +18,8 @@ Covers:
 Every test is fully mocked: zero network, no anthropic client constructed.
 """
 
+from datetime import date
+
 import pytest
 from pydantic import ValidationError, create_model
 from test_tools import (
@@ -30,7 +32,7 @@ from test_tools import (
     validation_error_for,
 )
 
-from triage.evals.cache import CachingClient, CallCache, cache_key
+from triage.evals.cache import CachingClient, CallCache, cache_key, prices_per_mtok
 from triage.tools import CategorizeResult, categorize
 
 MODEL = "claude-haiku-4-5"
@@ -193,6 +195,33 @@ class TestSchemaIdentity:
         # The stale entry is replaced, so the next call replays for free again.
         assert categorize(DIAGNOSABLE, model=MODEL, client=client) == result
         assert len(inner.messages.calls) == 2
+
+
+class TestModelPricing:
+    def test_sonnet_5_intro_price_through_cutover(self):
+        assert prices_per_mtok("claude-sonnet-5", today=date(2026, 8, 31)) == (2.0, 10.0)
+
+    def test_sonnet_5_list_price_after_cutover(self):
+        assert prices_per_mtok("claude-sonnet-5", today=date(2026, 9, 1)) == (3.0, 15.0)
+
+    def test_unknown_model_has_no_price(self):
+        assert prices_per_mtok("some-unknown-model") is None
+
+
+class TestInflightRecords:
+    def test_inflight_round_trip_survives_reopen(self, tmp_path):
+        path = tmp_path / "cache.db"
+        recording = CallCache(path)
+        recording.record_inflight("run-1", "batch_abc", ["k1", "k2"])
+        recording.close()
+        reopened = CallCache(path)
+        try:
+            assert reopened.get_inflight("run-1") == ("batch_abc", ["k1", "k2"])
+            assert reopened.get_inflight("other-run") is None
+            reopened.clear_inflight("run-1")
+            assert reopened.get_inflight("run-1") is None
+        finally:
+            reopened.close()
 
 
 class TestCacheKey:

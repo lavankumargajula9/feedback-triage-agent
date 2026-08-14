@@ -33,6 +33,7 @@ from triage.evals.batch import (
     BatchCollectingClient,
     PendingBatchCall,
     WaveLedger,
+    _strict_schema,
 )
 from triage.evals.cache import CachingClient, CallCache, call_cost
 from triage.evals.judge import DimensionScore, JudgeResult, score_run_batch
@@ -45,7 +46,7 @@ from triage.evals.runner import (
     write_results,
 )
 from triage.tools.llm import call_with_schema
-from triage.tools.schemas import FAILURE_MALFORMED, CategorizeResult
+from triage.tools.schemas import FAILURE_MALFORMED, FAILURE_REFUSAL, CategorizeResult
 
 MODEL = "claude-haiku-4-5"
 
@@ -79,6 +80,7 @@ ANSWERS_BY_TITLE = {
 TOKENS_IN, TOKENS_OUT = 100, 10
 
 ERRORED = object()
+REFUSED = object()
 
 
 class FakeBatches:
@@ -108,6 +110,16 @@ class FakeBatches:
             return SimpleNamespace(
                 custom_id=request["custom_id"],
                 result=SimpleNamespace(type="errored", message=None),
+            )
+        if answer is REFUSED:
+            message = SimpleNamespace(
+                content=[],
+                usage=SimpleNamespace(input_tokens=TOKENS_IN, output_tokens=TOKENS_OUT),
+                stop_reason="refusal",
+            )
+            return SimpleNamespace(
+                custom_id=request["custom_id"],
+                result=SimpleNamespace(type="succeeded", message=message),
             )
         message = SimpleNamespace(
             content=[SimpleNamespace(type="text", text=answer)],
@@ -179,6 +191,38 @@ class TestCollector:
         with pytest.raises(PendingBatchCall):
             collector.messages.parse(**parse_kwargs("a different thread"))
         assert len(ledger.pending) == 2
+
+
+BANNED_SCHEMA_KEYWORDS = {
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+    "pattern",
+}
+
+
+def walk_schema_nodes(node):
+    yield node
+    values = node.values() if isinstance(node, dict) else node if isinstance(node, list) else ()
+    for value in values:
+        yield from walk_schema_nodes(value)
+
+
+class TestStrictSchema:
+    def test_constraint_keywords_stripped_and_objects_closed(self):
+        raw = json.dumps(JudgeResult.model_json_schema())
+        assert "minimum" in raw and "maximum" in raw  # pydantic emits ge/le
+        for node in walk_schema_nodes(_strict_schema(JudgeResult)):
+            if isinstance(node, dict):
+                assert not BANNED_SCHEMA_KEYWORDS & node.keys()
+                if node.get("type") == "object":
+                    assert node.get("additionalProperties") is False
 
 
 class TestRunEvalBatch:
@@ -271,6 +315,100 @@ class TestRunEvalBatch:
         )
         assert categorize_submissions == 3
 
+    def test_persistent_refusal_records_refusal_kind(self, tmp_path):
+        def answer_for(title):
+            if title == "CategorizeResult":
+                return REFUSED
+            return ANSWERS_BY_TITLE[title]
+
+        threads = make_threads(1)
+        fake = FakeBatchClient(answer_for)
+        summary = run_eval_batch(
+            threads,
+            out_dir=tmp_path / "out",
+            cache_path=tmp_path / "cache.db",
+            pipeline_model=MODEL,
+            baseline_model=MODEL,
+            batch_client=fake,
+            poll_seconds=0,
+        )
+        assert summary["completed"] == 1
+        entry = json.loads(checkpoint_path(tmp_path / "out", 1).read_text(encoding="utf-8"))
+        assert entry["ok"] is False
+        failure = entry["pipeline"]["steps"]["categorize"]["failure"]
+        assert failure["kind"] == FAILURE_REFUSAL
+        assert failure["attempts"] == 3
+        # Three submissions of the refused call, no fourth.
+        categorize_submissions = sum(
+            1
+            for wave in fake.batches.created
+            for request in wave
+            if request["params"]["output_config"]["format"]["schema"]["title"]
+            == "CategorizeResult"
+        )
+        assert categorize_submissions == 3
+
+    def test_resume_skips_checkpointed_threads_even_with_cold_cache(self, tmp_path):
+        out_dir = tmp_path / "out"
+        common = {
+            "out_dir": out_dir,
+            "pipeline_model": MODEL,
+            "baseline_model": MODEL,
+            "poll_seconds": 0,
+        }
+        first = FakeBatchClient()
+        run_eval_batch(
+            make_threads(1), cache_path=tmp_path / "cache1.db", batch_client=first, **common
+        )
+        thread1_ids = {r["custom_id"] for wave in first.batches.created for r in wave}
+
+        # Same out_dir, cold cache: the checkpointed thread must cause zero
+        # submissions; only the new thread's calls reach the batch client.
+        second = FakeBatchClient()
+        summary = run_eval_batch(
+            make_threads(2), cache_path=tmp_path / "cache2.db", batch_client=second, **common
+        )
+        assert summary == {"completed": 2, "total": 2}
+        second_ids = {r["custom_id"] for wave in second.batches.created for r in wave}
+        assert second_ids
+        assert not thread1_ids & second_ids
+
+    def test_inflight_batch_is_reattached_not_recreated(self, tmp_path):
+        threads = make_threads(1)
+        common = {"pipeline_model": MODEL, "baseline_model": MODEL, "poll_seconds": 0}
+        first = FakeBatchClient()
+        run_eval_batch(
+            threads,
+            out_dir=tmp_path / "first",
+            cache_path=tmp_path / "seed.db",
+            batch_client=first,
+            **common,
+        )
+        wave1_ids = [r["custom_id"] for r in first.batches.created[0]]
+
+        # An interrupted run left wave 1 submitted but unabsorbed: the cache is
+        # cold except for the in-flight record pointing at that paid batch.
+        cache = CallCache(tmp_path / "resume.db")
+        cache.record_inflight("", "batch_1", wave1_ids)
+        cache.close()
+        resume = FakeBatchClient()
+        resume.batches._results["batch_1"] = first.batches._results["batch_1"]
+        original_create = resume.batches.create
+
+        def guarded_create(*, requests):
+            assert not set(wave1_ids) & {r["custom_id"] for r in requests}
+            return original_create(requests=requests)
+
+        resume.batches.create = guarded_create
+        summary = run_eval_batch(
+            threads,
+            out_dir=tmp_path / "resumed",
+            cache_path=tmp_path / "resume.db",
+            batch_client=resume,
+            **common,
+        )
+        assert summary == {"completed": 1, "total": 1}
+
     def test_erroring_entry_raises_but_leaves_run_resumable(self, tmp_path):
         def broken(title):
             if title == "BaselineResult":
@@ -323,6 +461,56 @@ class TestRunEvalBatch:
             threads, out_dir=tmp_path / "second", batch_client=ExplodingBatchClient(), **common
         )
         assert summary == {"completed": 1, "total": 1}
+
+
+class TestPolling:
+    def test_transient_retrieve_errors_are_retried(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("triage.evals.batch.time.sleep", lambda _: None)
+
+        class Overloaded(Exception):
+            status_code = 529
+
+        fake = FakeBatchClient()
+        original = fake.batches.retrieve
+        remaining = [Overloaded(), Overloaded()]
+
+        def flaky(batch_id):
+            if remaining:
+                raise remaining.pop()
+            return original(batch_id)
+
+        fake.batches.retrieve = flaky
+        summary = run_eval_batch(
+            make_threads(1),
+            out_dir=tmp_path / "out",
+            cache_path=tmp_path / "cache.db",
+            pipeline_model=MODEL,
+            baseline_model=MODEL,
+            batch_client=fake,
+            poll_seconds=0,
+        )
+        assert summary == {"completed": 1, "total": 1}
+
+    def test_poll_deadline_raises_and_keeps_inflight_record(self, tmp_path):
+        fake = FakeBatchClient()
+        fake.batches.retrieve = lambda batch_id: SimpleNamespace(
+            id=batch_id, processing_status="in_progress"
+        )
+        with pytest.raises(EvalError):
+            run_eval_batch(
+                make_threads(1),
+                out_dir=tmp_path / "out",
+                cache_path=tmp_path / "cache.db",
+                pipeline_model=MODEL,
+                baseline_model=MODEL,
+                batch_client=fake,
+                poll_seconds=0,
+                max_poll_seconds=0,
+            )
+        cache = CallCache(tmp_path / "cache.db")
+        inflight = cache.get_inflight("")
+        cache.close()
+        assert inflight == ("batch_1", [r["custom_id"] for r in fake.batches.created[0]])
 
 
 class TestScoreRunBatch:
@@ -401,7 +589,7 @@ class TestCollectorFailureReplay:
             collector.messages.parse(**kwargs)
         key = excinfo.value.key
         ledger.attempts[key] = 3
-        ledger.bad_payloads[key] = "not json at all"
+        ledger.bad_results[key] = ("payload", "not json at all")
 
         result = call_with_schema(
             "categorize",

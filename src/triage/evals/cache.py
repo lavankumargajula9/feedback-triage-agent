@@ -32,6 +32,7 @@ import sqlite3
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,14 +43,26 @@ RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 529})
 # One sleep per retry; len(BACKOFF_SECONDS) == number of transport retries.
 BACKOFF_SECONDS = (1.0, 2.0)
 
-# (input $/MTok, output $/MTok) per model id used by any role (R30, R22).
+# (input $/MTok, output $/MTok) per flat-priced model id used by any role
+# (R30, R22).
 PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-opus-5": (5.0, 25.0),
     "claude-fable-5": (10.0, 50.0),
     "claude-haiku-4-5": (1.0, 5.0),
-    # Intro price until 2026-08-31; (3.0, 15.0) after.
-    "claude-sonnet-5": (2.0, 10.0),
 }
+
+_SONNET_5_INTRO_END = date(2026, 8, 31)
+
+
+def _sonnet_5_prices(today: date) -> tuple[float, float]:
+    return (2.0, 10.0) if today <= _SONNET_5_INTRO_END else (3.0, 15.0)
+
+
+def prices_per_mtok(model: str, today: date | None = None) -> tuple[float, float] | None:
+    """(input, output) $/MTok for ``model``, or None with no price on file."""
+    if model == "claude-sonnet-5":
+        return _sonnet_5_prices(today or datetime.now(UTC).date())
+    return PRICES_PER_MTOK.get(model)
 
 # Per-call tally fields; ``unpriced_calls`` keeps a model with no price on file
 # from silently reporting as free.
@@ -66,7 +79,7 @@ USAGE_FIELDS = (
 
 def call_cost(model: str, tokens_in: int, tokens_out: int) -> float | None:
     """Dollars for one call's measured tokens, or None with no price on file."""
-    prices = PRICES_PER_MTOK.get(model)
+    prices = prices_per_mtok(model)
     if prices is None:
         return None
     in_price, out_price = prices
@@ -89,6 +102,12 @@ CREATE TABLE IF NOT EXISTS calls (
     schema TEXT NOT NULL,
     run_id TEXT NOT NULL,
     payload TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS inflight_batches (
+    run_id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    keys TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
@@ -159,6 +178,28 @@ class CallCache:
     def delete(self, key: str) -> None:
         """Drop one entry; committed immediately."""
         self._conn.execute("DELETE FROM calls WHERE key = ?", (key,))
+        self._conn.commit()
+
+    def record_inflight(self, run_id: str, batch_id: str, keys: list[str]) -> None:
+        """Persist a submitted-but-unfinished batch so an interrupted run can
+        re-attach to it instead of paying for a duplicate submission."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO inflight_batches (run_id, batch_id, keys) "
+            "VALUES (?, ?, ?)",
+            (run_id, batch_id, json.dumps(keys)),
+        )
+        self._conn.commit()
+
+    def get_inflight(self, run_id: str) -> tuple[str, list[str]] | None:
+        """(batch_id, keys) of the recorded in-flight batch, or None."""
+        row = self._conn.execute(
+            "SELECT batch_id, keys FROM inflight_batches WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return (row[0], json.loads(row[1])) if row is not None else None
+
+    def clear_inflight(self, run_id: str) -> None:
+        """Drop the in-flight record; committed immediately."""
+        self._conn.execute("DELETE FROM inflight_batches WHERE run_id = ?", (run_id,))
         self._conn.commit()
 
     def close(self) -> None:

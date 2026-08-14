@@ -37,8 +37,10 @@ from pydantic import BaseModel, Field
 from triage.evals.batch import (
     BATCH_DISCOUNT,
     DEFAULT_POLL_SECONDS,
+    MAX_POLL_SECONDS,
     BatchError,
     PendingBatchCall,
+    batch_client_factory,
     drive_waves,
 )
 from triage.evals.cache import CachingClient, CallCache, call_cost, usage_delta
@@ -581,6 +583,7 @@ def run_eval_batch(
     run_id: str = "",
     batch_client: Any = None,
     poll_seconds: float = DEFAULT_POLL_SECONDS,
+    max_poll_seconds: float = MAX_POLL_SECONDS,
 ) -> dict[str, int]:
     """run_eval through the Messages Batch API at 50% of list price (KTD5, R32).
 
@@ -588,7 +591,8 @@ def run_eval_batch(
     execution is wave-based (see :mod:`triage.evals.batch`). Per-thread usage
     is attributed from batch results with the discount applied; latency is
     recorded as zero because a batch has no per-call latency to measure —
-    latency comparisons come from sync runs only.
+    latency comparisons come from sync runs only. Checkpoint usage counts
+    billed batch calls only (``calls`` == billed; ``cached_calls`` stays 0).
     """
     out_dir = Path(out_dir)
     checkpoint_dir(out_dir).mkdir(parents=True, exist_ok=True)
@@ -599,13 +603,7 @@ def run_eval_batch(
     fingerprints = {tid: thread_fingerprint(thread) for tid, thread in threads.items()}
     _check_checkpoint_identity(out_dir, sorted(done), identity, fingerprints)
     cache = CallCache(cache_path)
-
-    def client_factory() -> Any:
-        if batch_client is not None:
-            return batch_client
-        from triage.tools.llm import make_client
-
-        return make_client()
+    client_factory = batch_client_factory(batch_client)
 
     def pass_fn(collector: Any) -> bool:
         all_done = True
@@ -656,6 +654,7 @@ def run_eval_batch(
             run_id=run_id,
             batch_client_factory=client_factory,
             poll_seconds=poll_seconds,
+            max_poll_seconds=max_poll_seconds,
         )
     except BatchError as exc:
         raise EvalError(f"batch eval failed: {exc}; {resume_instruction(out_dir)}") from None

@@ -9,12 +9,13 @@ requests as one batch, validates each result against its schema, writes
 successes into the same cache, and re-executes — completed calls replay for
 free, so each dependent pipeline step becomes the next wave.
 
-Failure semantics mirror the sync path (R27): a result the schema rejects is
-resubmitted up to the same three total attempts, after which the collector
-replays the last bad payload so ``call_with_schema`` raises the same
-ValidationError kinds and returns the same typed OutputFailure. Transport
-failures (errored/canceled/expired batch entries) raise, as they do in sync
-mode, leaving the cache resumable.
+Failure semantics mirror the sync path (R27): a result the schema rejects —
+or a refusal — is resubmitted up to the same three total attempts, after which
+the collector replays the recorded failure (the last bad payload's true
+ValidationError, or a no-output message for refusals) so ``call_with_schema``
+returns the same typed OutputFailure kinds. Transport failures
+(errored/canceled/expired batch entries) raise, as they do in sync mode,
+leaving the cache resumable.
 """
 
 from __future__ import annotations
@@ -28,7 +29,10 @@ from typing import Any
 from pydantic import ValidationError
 
 from triage.evals.cache import (
+    BACKOFF_SECONDS,
+    RETRYABLE_STATUS,
     CallCache,
+    _CachedMessage,
     call_cost,
     empty_usage,
     replay_message,
@@ -48,6 +52,8 @@ MAX_TRANSPORT_FAILURES = 3
 # this; exceeding it means the run is not converging.
 MAX_WAVES = 20
 DEFAULT_POLL_SECONDS = 10.0
+# The Batch API completes within 24h; past this the batch is presumed stuck.
+MAX_POLL_SECONDS = 26 * 3600
 
 
 class BatchError(Exception):
@@ -69,7 +75,8 @@ class WaveLedger:
     pending: dict[str, dict[str, Any]] = field(default_factory=dict)
     owners: dict[str, Any] = field(default_factory=dict)
     attempts: Counter = field(default_factory=Counter)
-    bad_payloads: dict[str, str] = field(default_factory=dict)
+    # key -> ("payload", rejected_text) | ("refusal", stop_reason)
+    bad_results: dict[str, tuple[str, str]] = field(default_factory=dict)
     transport_failures: Counter = field(default_factory=Counter)
     spent: dict[Any, dict[str, float]] = field(default_factory=dict)
 
@@ -87,7 +94,7 @@ class _CollectingMessages:
         self._client = client
 
     def parse(self, **kwargs: Any) -> Any:
-        key, model, schema, schema_name = request_identity(kwargs, self._run_id)
+        key, _, schema, _ = request_identity(kwargs, self._run_id)
         payload = self._cache.get(key)
         if payload is not None:
             try:
@@ -95,21 +102,13 @@ class _CollectingMessages:
             except ValidationError:
                 self._cache.delete(key)
         ledger = self._ledger
-        if ledger.attempts[key] >= MAX_ATTEMPTS and key in ledger.bad_payloads:
+        if ledger.attempts[key] >= MAX_ATTEMPTS and key in ledger.bad_results:
+            kind, value = ledger.bad_results[key]
+            if kind == "refusal":
+                return _CachedMessage(parsed_output=None, stop_reason=value)
             # Replay the last rejected text so call_with_schema raises the
             # true ValidationError and reports the true failure kind (R27).
-            message = replay_message(ledger.bad_payloads[key], schema)
-            # The schema accepts it now (schema changed since the batch ran):
-            # promote it to a normal cached success.
-            self._cache.put(
-                key,
-                model=model,
-                schema_name=schema_name,
-                run_id=self._run_id,
-                payload=message.parsed_output.model_dump_json(),
-            )
-            del ledger.bad_payloads[key]
-            return message
+            return replay_message(value, schema)
         ledger.pending[key] = dict(kwargs)
         ledger.owners.setdefault(key, self._client.owner)
         raise PendingBatchCall(key)
@@ -128,23 +127,51 @@ class BatchCollectingClient:
         self.messages = _CollectingMessages(cache, ledger, run_id, self)
 
 
+# Constraint keywords structured outputs rejects; ranges stay enforced
+# client-side because absorption validates with the pydantic schema.
+_UNSUPPORTED_KEYWORDS = frozenset(
+    {
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "pattern",
+    }
+)
+# Mappings whose KEYS are names, not schema keywords; only their values are
+# schema nodes.
+_NAMED_CHILD_KEYS = frozenset({"properties", "$defs", "definitions"})
+
+
 def _strict_schema(schema: Any) -> dict[str, Any]:
-    """The schema's JSON shape with every object closed, as structured
-    outputs require; the SDK's parse() does this transform for sync calls."""
+    """The schema's JSON shape with every object closed and unsupported
+    constraint keywords removed, as structured outputs require; the SDK's
+    parse() does this transform for sync calls."""
     node = schema.model_json_schema()
-    _close_objects(node)
+    _strictify(node)
     return node
 
 
-def _close_objects(node: Any) -> None:
+def _strictify(node: Any) -> None:
     if isinstance(node, dict):
+        for keyword in _UNSUPPORTED_KEYWORDS & node.keys():
+            del node[keyword]
         if node.get("type") == "object":
             node.setdefault("additionalProperties", False)
-        for value in node.values():
-            _close_objects(value)
+        for key, value in node.items():
+            if key in _NAMED_CHILD_KEYS and isinstance(value, dict):
+                for child in value.values():
+                    _strictify(child)
+            else:
+                _strictify(value)
     elif isinstance(node, list):
         for value in node:
-            _close_objects(value)
+            _strictify(value)
 
 
 def _batch_params(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -157,11 +184,12 @@ def _batch_params(kwargs: dict[str, Any]) -> dict[str, Any]:
     return params
 
 
-def _first_text(message: Any) -> str:
+def _first_text(message: Any) -> str | None:
+    """The first text block's text, or None when the message has none."""
     for block in getattr(message, "content", None) or ():
         if getattr(block, "type", None) == "text":
             return getattr(block, "text", "") or ""
-    return ""
+    return None
 
 
 def _tally(ledger: WaveLedger, key: str, model: str, message: Any) -> None:
@@ -188,16 +216,21 @@ def _absorb_success(
     _, model, schema, schema_name = request_identity(kwargs, run_id)
     _tally(ledger, key, model, message)
     text = _first_text(message)
+    stop_reason = getattr(message, "stop_reason", None)
+    if stop_reason == "refusal" or text is None:
+        ledger.attempts[key] += 1
+        ledger.bad_results[key] = ("refusal", str(stop_reason))
+        return
     try:
         parsed = schema.model_validate_json(text)
     except ValidationError:
         ledger.attempts[key] += 1
-        ledger.bad_payloads[key] = text
+        ledger.bad_results[key] = ("payload", text)
         return
     cache.put(
         key, model=model, schema_name=schema_name, run_id=run_id, payload=parsed.model_dump_json()
     )
-    ledger.bad_payloads.pop(key, None)
+    ledger.bad_results.pop(key, None)
 
 
 def _register_transport_failure(ledger: WaveLedger, key: str, detail: str) -> None:
@@ -209,6 +242,50 @@ def _register_transport_failure(ledger: WaveLedger, key: str, detail: str) -> No
         )
 
 
+def batch_client_factory(batch_client: Any) -> Callable[[], Any]:
+    """A factory for the injected client, else the lazily built real one (R30)."""
+
+    def factory() -> Any:
+        if batch_client is not None:
+            return batch_client
+        from triage.tools.llm import make_client
+
+        return make_client()
+
+    return factory
+
+
+def _retrieve_with_backoff(api: Any, batch_id: str) -> Any:
+    """Serial retry on transient (429/5xx) errors; everything else raises."""
+    for attempt in range(len(BACKOFF_SECONDS) + 1):
+        try:
+            return api.messages.batches.retrieve(batch_id)
+        except Exception as exc:
+            retryable = getattr(exc, "status_code", None) in RETRYABLE_STATUS
+            if not retryable or attempt >= len(BACKOFF_SECONDS):
+                raise
+            time.sleep(BACKOFF_SECONDS[attempt])
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _open_batch(ledger: WaveLedger, *, cache: CallCache, run_id: str, api: Any) -> tuple[str, Any]:
+    """(batch_id, initial status): re-attach to the recorded in-flight batch —
+    already paid for — when its keys are all still pending, else create."""
+    inflight = cache.get_inflight(run_id)
+    if inflight is not None:
+        batch_id, keys = inflight
+        if set(keys) <= set(ledger.pending):
+            return batch_id, _retrieve_with_backoff(api, batch_id)
+        cache.clear_inflight(run_id)
+    requests = [
+        {"custom_id": key, "params": _batch_params(kwargs)}
+        for key, kwargs in ledger.pending.items()
+    ]
+    batch = api.messages.batches.create(requests=requests)
+    cache.record_inflight(run_id, batch.id, list(ledger.pending))
+    return batch.id, batch
+
+
 def submit_wave(
     ledger: WaveLedger,
     *,
@@ -216,21 +293,23 @@ def submit_wave(
     run_id: str,
     client_factory: Callable[[], Any],
     poll_seconds: float,
+    max_poll_seconds: float = MAX_POLL_SECONDS,
 ) -> None:
     """Submit every pending request as ONE batch and absorb its results."""
-    requests = [
-        {"custom_id": key, "params": _batch_params(kwargs)}
-        for key, kwargs in ledger.pending.items()
-    ]
     api = client_factory()
-    batch = api.messages.batches.create(requests=requests)
-    status = batch
+    batch_id, status = _open_batch(ledger, cache=cache, run_id=run_id, api=api)
+    started = time.monotonic()
     while getattr(status, "processing_status", "ended") != "ended":
+        if time.monotonic() - started >= max_poll_seconds:
+            raise BatchError(
+                f"batch {batch_id} still processing after {max_poll_seconds:.0f}s; "
+                "it stays recorded — re-run to re-attach without paying again"
+            )
         time.sleep(poll_seconds)
-        status = api.messages.batches.retrieve(batch.id)
+        status = _retrieve_with_backoff(api, batch_id)
     seen: set[str] = set()
     failures: list[tuple[str, str]] = []
-    for result in api.messages.batches.results(batch.id):
+    for result in api.messages.batches.results(batch_id):
         seen.add(result.custom_id)
         outcome = result.result
         if getattr(outcome, "type", None) == "succeeded":
@@ -240,6 +319,7 @@ def submit_wave(
     for key in set(ledger.pending) - seen:
         failures.append((key, "missing from batch results"))
     ledger.pending.clear()
+    cache.clear_inflight(run_id)
     # Raised only after every success in the wave is cached, so a transport
     # failure never discards paid-for answers.
     for key, detail in failures:
@@ -253,6 +333,7 @@ def drive_waves(
     run_id: str,
     batch_client_factory: Callable[[], Any],
     poll_seconds: float = DEFAULT_POLL_SECONDS,
+    max_poll_seconds: float = MAX_POLL_SECONDS,
 ) -> WaveLedger:
     """Run ``pass_fn`` against fresh collectors until it reports completion.
 
@@ -277,5 +358,6 @@ def drive_waves(
             run_id=run_id,
             client_factory=batch_client_factory,
             poll_seconds=poll_seconds,
+            max_poll_seconds=max_poll_seconds,
         )
     raise BatchError(f"batch execution did not converge within {MAX_WAVES} waves")

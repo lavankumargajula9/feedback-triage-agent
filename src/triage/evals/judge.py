@@ -42,8 +42,10 @@ from pydantic import BaseModel, Field
 
 from triage.evals.batch import (
     DEFAULT_POLL_SECONDS,
+    MAX_POLL_SECONDS,
     BatchError,
     PendingBatchCall,
+    batch_client_factory,
     drive_waves,
 )
 from triage.evals.cache import CachingClient, CallCache, call_cost
@@ -567,6 +569,7 @@ def score_run_batch(
     threads: Mapping[int, str] | None = None,
     run_id: str = "",
     poll_seconds: float = DEFAULT_POLL_SECONDS,
+    max_poll_seconds: float = MAX_POLL_SECONDS,
 ) -> dict[str, Any]:
     """score_run through the Messages Batch API at 50% of list price (R13, KTD5).
 
@@ -586,13 +589,7 @@ def score_run_batch(
     _refuse_mismatched_checkpoints(out_dir, items, identity)
     per_system: dict[str, dict[int, dict[str, Any]]] = {system: {} for system in _DRAFT_EXTRACTORS}
     cache = CallCache(cache_path)
-
-    def client_factory() -> Any:
-        if batch_client is not None:
-            return batch_client
-        from triage.tools.llm import make_client
-
-        return make_client()
+    client_factory = batch_client_factory(batch_client)
 
     def pass_fn(collector: Any) -> bool:
         all_done = True
@@ -636,6 +633,7 @@ def score_run_batch(
             run_id=run_id,
             batch_client_factory=client_factory,
             poll_seconds=poll_seconds,
+            max_poll_seconds=max_poll_seconds,
         )
     except BatchError as exc:
         raise EvalError(f"batch judge scoring failed: {exc}") from None
